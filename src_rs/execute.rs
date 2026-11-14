@@ -33,7 +33,6 @@ use crate::vm::{
     concat_stack, float_to_integer, idiv, is_false, modulus, modulus_float, raw_equal, shiftl,
     shiftr, to_integer_ns, to_number, to_number_ns, F2IMode,
 };
-use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(debug_assertions)]
@@ -4288,7 +4287,7 @@ impl VmExecutor {
             #[cfg(feature = "fast_unsafe")]
             debug_assert!(b < upvals.len());
             #[cfg(feature = "fast_unsafe")]
-            let uv: &UpVal<'a> = unsafe { &*upvals[b].as_ptr() };
+            let uv: &UpVal<'a> = unsafe { &*upvals[b].as_ref().as_ptr() };
             #[cfg(not(feature = "fast_unsafe"))]
             let uv_guard = upvals[b].borrow();
             #[cfg(not(feature = "fast_unsafe"))]
@@ -4314,7 +4313,7 @@ impl VmExecutor {
         {
             let upvals = unsafe { &*state.closure_upvals().as_ptr() };
             if b < upvals.len() {
-                let uv = unsafe { &mut *upvals[b].as_ptr() };
+                let uv = unsafe { &mut *upvals[b].as_ref().as_ptr() };
                 match uv {
                     UpVal::Closed { value } => {
                         unsafe {
@@ -4415,7 +4414,7 @@ impl VmExecutor {
             let upvals: &UpValVec<'a> = &upvals_guard;
             if b < upvals.len() {
                 #[cfg(feature = "fast_unsafe")]
-                let uv: &UpVal<'a> = unsafe { &*upvals[b].as_ptr() };
+                let uv: &UpVal<'a> = unsafe { &*upvals[b].as_ref().as_ptr() };
                 #[cfg(not(feature = "fast_unsafe"))]
                 let uv_guard = upvals[b].borrow();
                 #[cfg(not(feature = "fast_unsafe"))]
@@ -8799,27 +8798,33 @@ impl VmExecutor {
                         // 上值来自当前栈帧: 通过 find_upval 创建/查找 Open 上值
                         // 对应 C: upv[i] = luaF_findupval(L, base + p->upvalues[i].idx);
                         let stack_idx = state.base + desc.idx as usize;
-                        let uv_idx = crate::func::find_upval(state, stack_idx);
+                        let uv_idx = crate::func::find_upval(state, stack_idx)?;
                         let uv_ref = crate::func::upval_slot(state, uv_idx)
                             .expect("find_upval returns a live slot")
                             .clone();
-                        upvals.push(uv_ref);
+                        upvals.push_ref(uv_ref);
                     } else {
                         // 上值来自外层闭包: 共享同一个 Rc<RefCell<UpVal>>
                         // 对应 C: upv[i] = cl->upvals[p->upvalues[i].idx];
                         let parent_idx = desc.idx as usize;
                         let parent_uv = state.closure_upvals().borrow().get(parent_idx).cloned();
                         match parent_uv {
-                            Some(uv_ref) => upvals.push(uv_ref),
-                            None => upvals.push(Rc::new(RefCell::new(UpVal::Closed {
-                                value: TValue::Nil(NilKind::Strict),
-                            }))),
+                            Some(uv_ref) => upvals.push_ref(uv_ref),
+                            None => upvals.push_val(
+                                state,
+                                UpVal::Closed {
+                                    value: TValue::Nil(NilKind::Strict),
+                                },
+                            )?,
                         }
                     }
                 } else {
-                    upvals.push(Rc::new(RefCell::new(UpVal::Closed {
-                        value: TValue::Nil(NilKind::Strict),
-                    })));
+                    upvals.push_val(
+                        state,
+                        UpVal::Closed {
+                            value: TValue::Nil(NilKind::Strict),
+                        },
+                    )?;
                 }
             }
             // GC: 在创建新闭包前检查 GC 阈值，回收不可达的旧闭包。
@@ -9664,6 +9669,7 @@ mod tests {
     use crate::objects::NilKind;
     use crate::state::GlobalShared;
     use crate::strings::StringTable;
+    use std::cell::RefCell;
     use std::rc::Rc;
 
     fn format_float(f: LuaNumber) -> String {

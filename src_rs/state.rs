@@ -2700,13 +2700,25 @@ impl<'a> LuaState<'a> {
             Ok(proto) => {
                 let nup = proto.size_upvalues as usize;
                 let mut upvals = UpValVec::new();
-                upvals.push(Rc::new(RefCell::new(UpVal::Closed {
-                    value: TValue::Table(self.globals.clone()),
-                })));
+                match upvals.push_val(
+                    self,
+                    UpVal::Closed {
+                        value: TValue::Table(self.globals.clone()),
+                    },
+                ) {
+                    Ok(it) => it,
+                    Err(_err) => return ERR_MEM,
+                };
                 for _ in 1..nup {
-                    upvals.push(Rc::new(RefCell::new(UpVal::Closed {
-                        value: TValue::Nil(NilKind::Strict),
-                    })));
+                    match upvals.push_val(
+                        self,
+                        UpVal::Closed {
+                            value: TValue::Nil(NilKind::Strict),
+                        },
+                    ) {
+                        Ok(it) => it,
+                        Err(_err) => return ERR_MEM,
+                    };
                 }
                 // new_closure 完成「构造 + 对象块分配 + GC 登记 + id 写回」；
                 // 失败同样按内存错误上报（对应 C 的 lua_load：返回 LUA_ERRMEM，
@@ -2757,14 +2769,26 @@ impl<'a> LuaState<'a> {
                     // 驻留化字符串 (LongString → ShortString)
                     crate::stdlib::base_lib::intern_proto_strings(&mut proto, self);
                     let nup = proto.size_upvalues as usize;
-                    let mut upvals = UpValVec::new();
-                    upvals.push(Rc::new(RefCell::new(UpVal::Closed {
-                        value: TValue::Table(self.globals.clone()),
-                    })));
+                    let mut upvals = UpValVec::with_capacity(nup);
+                    match upvals.push_val(
+                        self,
+                        UpVal::Closed {
+                            value: TValue::Table(self.globals.clone()),
+                        },
+                    ) {
+                        Ok(_) => {}
+                        Err(_) => return ERR_MEM,
+                    }
                     for _ in 1..nup {
-                        upvals.push(Rc::new(RefCell::new(UpVal::Closed {
-                            value: TValue::Nil(NilKind::Strict),
-                        })));
+                        match upvals.push_val(
+                            self,
+                            UpVal::Closed {
+                                value: TValue::Nil(NilKind::Strict),
+                            },
+                        ) {
+                            Ok(_) => {}
+                            Err(_) => return ERR_MEM,
+                        }
                     }
                     // 见 load_buffer：new_closure 含 GC 登记，失败走 LUA_ERRMEM 语义
                     let closure = match self.new_closure(Rc::new(proto), upvals) {

@@ -25,7 +25,7 @@
 //! `clear_weak_tables` / `mark_tvalue` 等）。`state.rs` 只保留数据结构、栈操作、
 //! 调用/错误保护、C API 桥接。
 
-use crate::alloc::{MyRc, WeakRc};
+use crate::alloc::{MyRc, SimpleRc, WeakRc};
 use crate::execute::VmError;
 use crate::mem::SlotAlloc;
 use crate::objects::{
@@ -2194,7 +2194,7 @@ impl<'a> LuaState<'a> {
             if let TValue::Thread(t) = val {
                 let origins = t.context.borrow().upval_origins.clone();
                 for (uv_ref, stack_index) in origins {
-                    let ptr = Rc::as_ptr(&uv_ref) as usize;
+                    let ptr = SimpleRc::as_ptr(&uv_ref) as usize;
                     upval_origins_map.insert(ptr, stack_index);
                 }
             }
@@ -2229,7 +2229,7 @@ impl<'a> LuaState<'a> {
                 c.upvals
                     .borrow()
                     .iter()
-                    .map(|uv_ref| Rc::as_ptr(uv_ref) as usize)
+                    .map(|uv_ref| SimpleRc::as_ptr(uv_ref) as usize)
                     .collect()
             } else {
                 Vec::new()
@@ -2289,7 +2289,7 @@ impl<'a> LuaState<'a> {
                         if let TValue::Thread(t) = val {
                             let origins = t.context.borrow().upval_origins.clone();
                             for (uv_ref, _idx) in &origins {
-                                if Rc::as_ptr(uv_ref) as usize == *uv_ptr {
+                                if SimpleRc::as_ptr(uv_ref) as usize == *uv_ptr {
                                     let uv = uv_ref.borrow();
                                     if let UpVal::Closed { value } = &*uv {
                                         found_val = Some(value.clone());

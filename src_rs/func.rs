@@ -1,4 +1,6 @@
+use crate::alloc::SimpleRc;
 use crate::execute::VmError;
+use crate::mem::AllocFailed;
 use crate::objects::*;
 use crate::state::LuaState;
 use crate::strings::lua_string_as_str;
@@ -38,11 +40,11 @@ pub fn upval_slot<'s, 'a>(state: &'s LuaState<'a>, uv_idx: usize) -> Option<&'s 
 
 /// 按 Rc 指针查找 arena 中的槽位索引。
 pub fn find_upval_slot<'a>(state: &LuaState<'a>, uv_ref: &UpValRef<'a>) -> Option<usize> {
-    let ptr = Rc::as_ptr(uv_ref) as usize;
-    state
-        .open_upvals
-        .iter()
-        .position(|r| r.as_ref().map_or(false, |x| Rc::as_ptr(x) as usize == ptr))
+    let ptr = SimpleRc::as_ptr(uv_ref) as usize;
+    state.open_upvals.iter().position(|r| {
+        r.as_ref()
+            .map_or(false, |x| SimpleRc::as_ptr(x) as usize == ptr)
+    })
 }
 
 /// 把 upvalue 引用登记进 arena，返回其槽位索引（已登记则直接返回既有索引）。
@@ -70,7 +72,7 @@ pub fn register_upval_slot<'a>(state: &mut LuaState<'a>, uv_ref: &UpValRef<'a>) 
     idx
 }
 
-pub fn find_upval(state: &mut LuaState, level: usize) -> usize {
+pub fn find_upval<'a>(state: &mut LuaState<'a>, level: usize) -> Result<usize, VmError<'a>> {
     if !state.is_in_twups {
         state.g_mut().twups_linked = true;
     }
@@ -98,7 +100,7 @@ pub fn find_upval(state: &mut LuaState, level: usize) -> usize {
             break;
         }
         if uv_level == level {
-            return uv_idx;
+            return Ok(uv_idx);
         }
         prev = Some(uv_idx);
         current = next;
@@ -106,7 +108,11 @@ pub fn find_upval(state: &mut LuaState, level: usize) -> usize {
     new_upval(state, level, prev)
 }
 
-fn new_upval(state: &mut LuaState, level: usize, prev: Option<usize>) -> usize {
+fn new_upval<'a>(
+    state: &mut LuaState<'a>,
+    level: usize,
+    prev: Option<usize>,
+) -> Result<usize, VmError<'a>> {
     // 优先复用已回收槽位（closed upvalue 关闭时归还），否则追加。
     // 复用安全：被释放的槽位不再出现在 open_upval 链表中。
     let uv_idx = match state.free_upvals.pop() {
@@ -143,12 +149,23 @@ fn new_upval(state: &mut LuaState, level: usize, prev: Option<usize>) -> usize {
             *previous = Some(uv_idx);
         }
     }
-    let new_slot = Rc::new(RefCell::new(UpVal::Open {
+    let slot = state.alloc_slot();
+    let mut upvalue = Some(RefCell::new(UpVal::Open {
         stack_index: level,
         next,
         previous: prev,
         tbc: false,
     }));
+    let new_slot = state.retry_alloc(move || {
+        let u = upvalue.take().expect("");
+        match SimpleRc::try_new_in(slot, u) {
+            Ok(r) => Ok(r),
+            Err(v) => {
+                upvalue = Some(v);
+                Err(AllocFailed)
+            }
+        }
+    })?;
     if uv_idx < state.open_upvals.len() {
         debug_assert!(
             state.open_upvals[uv_idx].is_none(),
@@ -158,7 +175,7 @@ fn new_upval(state: &mut LuaState, level: usize, prev: Option<usize>) -> usize {
     } else {
         state.open_upvals.push(Some(new_slot));
     }
-    uv_idx
+    Ok(uv_idx)
 }
 
 pub fn close_upval(state: &mut LuaState, uv_idx: usize) {
@@ -456,7 +473,7 @@ pub fn new_tbc_upval<'a>(
         )));
     }
     // TBC upvalue 复用 open_upval 链表（通过 find_upval 加入），用 tbc 字段标记
-    let uv_idx = find_upval(state, level);
+    let uv_idx = find_upval(state, level)?;
     if let Some(uv_ref) = upval_slot(state, uv_idx) {
         if let UpVal::Open { ref mut tbc, .. } = &mut *uv_ref.borrow_mut() {
             *tbc = true;
@@ -527,9 +544,9 @@ mod tests {
     fn test_find_upval_finds_existing_open_upval() {
         let mut state = make_vm_state();
         state.stack = vec![TValue::Integer(1), TValue::Integer(2), TValue::Integer(3)];
-        let uv = find_upval(&mut state, 1);
+        let uv = find_upval(&mut state, 1).unwrap();
         assert_eq!(uv, 0);
-        let found = find_upval(&mut state, 1);
+        let found = find_upval(&mut state, 1).unwrap();
         assert_eq!(found, 0);
     }
 
@@ -537,9 +554,9 @@ mod tests {
     fn test_find_upval_creates_new_upval_if_not_found() {
         let mut state = make_vm_state();
         state.stack = vec![TValue::Integer(1), TValue::Integer(2)];
-        let uv = find_upval(&mut state, 0);
+        let uv = find_upval(&mut state, 0).unwrap();
         assert_eq!(uv, 0);
-        let uv2 = find_upval(&mut state, 1);
+        let uv2 = find_upval(&mut state, 1).unwrap();
         assert_eq!(uv2, 1);
     }
 
@@ -547,7 +564,7 @@ mod tests {
     fn test_close_upval_closes_open_upval() {
         let mut state = make_vm_state();
         state.stack = vec![TValue::Integer(42)];
-        let uv = find_upval(&mut state, 0);
+        let uv = find_upval(&mut state, 0).unwrap();
         let uv_ref = state.open_upvals[uv].clone().expect("slot holds upvalue");
         assert!(uv_ref.borrow().is_open());
         close_upval(&mut state, uv);
@@ -569,7 +586,7 @@ mod tests {
         state.stack = vec![TValue::Integer(0)];
         for round in 0..100 {
             state.stack[0] = TValue::Integer(round);
-            let uv = find_upval(&mut state, 0);
+            let uv = find_upval(&mut state, 0).unwrap();
             let _ = close(&mut state, 0, 0, 0);
             assert!(
                 state.open_upvals.len() <= 1,
@@ -585,9 +602,9 @@ mod tests {
     fn test_unlink_upval_removes_from_list() {
         let mut state = make_vm_state();
         state.stack = vec![TValue::Integer(1), TValue::Integer(2), TValue::Integer(3)];
-        let _uv0 = find_upval(&mut state, 0);
-        let uv1 = find_upval(&mut state, 1);
-        let uv2 = find_upval(&mut state, 2);
+        let _uv0 = find_upval(&mut state, 0).unwrap();
+        let uv1 = find_upval(&mut state, 1).unwrap();
+        let uv2 = find_upval(&mut state, 2).unwrap();
         assert_eq!(state.open_upval, Some(uv2));
         close_upval(&mut state, uv2);
         assert_eq!(state.open_upval, Some(uv1));
@@ -601,9 +618,9 @@ mod tests {
             TValue::Integer(20),
             TValue::Integer(30),
         ];
-        let _uv0 = find_upval(&mut state, 0);
-        let _uv1 = find_upval(&mut state, 1);
-        let _uv2 = find_upval(&mut state, 2);
+        let _uv0 = find_upval(&mut state, 0).unwrap();
+        let _uv1 = find_upval(&mut state, 1).unwrap();
+        let _uv2 = find_upval(&mut state, 2).unwrap();
         let _ = close(&mut state, 1, 0, 0);
         assert_eq!(state.open_upval, Some(0));
     }

@@ -20,7 +20,7 @@
 
 #![allow(non_snake_case, non_camel_case_types, unused_imports)]
 
-use crate::alloc::MyRc;
+use crate::alloc::{MyRc, SimpleRc};
 use crate::mem::SlotAlloc;
 use std::any::{type_name, Any};
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
@@ -4649,7 +4649,7 @@ pub extern "C-unwind" fn lua_upvalueid(L: *mut lua_State, fidx: c_int, n: c_int)
         Some(TValue::LClosure(closure)) => {
             let upvals = closure.upvals.borrow();
             if n <= upvals.len() {
-                Rc::as_ptr(&upvals[n - 1]) as *mut c_void
+                SimpleRc::as_ptr(&upvals[n - 1]) as *mut c_void
             } else {
                 std::ptr::null_mut()
             }

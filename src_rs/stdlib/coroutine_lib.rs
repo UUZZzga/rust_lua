@@ -12,6 +12,7 @@
 //! - coroutine.wrap 返回 RustClosure（携带 upvalues[0] = Thread），
 //!   由 op_call 的 RustClosure 分支派发到 call_wrap_fn
 
+use crate::alloc::SimpleRc;
 use crate::execute::{VmError, VmExecutor, VmResult};
 use crate::objects::{
     BuiltinFn, LClosure, LuaThread, NilKind, TValue, Table, ThreadContext, ThreadStatus, UpVal,
@@ -211,7 +212,7 @@ fn reclose_parent_upvals<'a>(state: &mut LuaState<'a>, origins: &[(UpValRef<'a>,
 
 /// 开 upvalue 信息（首次 resume 时收集）
 struct OpenUpvalInfo<'a> {
-    uv_ref: Rc<RefCell<UpVal<'a>>>,
+    uv_ref: UpValRef<'a>,
     original_stack_index: usize,
 }
 
@@ -307,11 +308,7 @@ fn scan_stack_for_closures<'a>(
 /// 通过 Rc 指针关闭 upvalue（unlink + 设置为 Closed）
 /// 协程场景下必须先从 open_upval 链表移除再设为 Closed，
 /// 否则链表中残留的 Closed upvalue 会让 func::close 遍历中断（Closed 无 next 字段）
-fn close_upval_by_ref<'a>(
-    state: &mut LuaState<'a>,
-    uv_ref: &Rc<RefCell<UpVal<'a>>>,
-    val: TValue<'a>,
-) {
+fn close_upval_by_ref<'a>(state: &mut LuaState<'a>, uv_ref: &UpValRef<'a>, val: TValue<'a>) {
     let uv_idx = crate::func::register_upval_slot(state, uv_ref);
     crate::func::unlink_upval(state, uv_idx);
     *uv_ref.borrow_mut() = UpVal::Closed { value: val };
@@ -321,7 +318,7 @@ fn close_upval_by_ref<'a>(
 /// 当 upvalue 的值是 LClosure 时，递归处理该闭包的 upvalue
 /// 当 upvalue 的值是 Table 时，递归扫描 Table（包括元表）中的 LClosure
 fn collect_and_close_upvals<'a>(
-    upvals: &[Rc<RefCell<UpVal<'a>>>],
+    upvals: &[UpValRef<'a>],
     state: &mut LuaState<'a>,
     result: &mut Vec<OpenUpvalInfo<'a>>,
     visited: &mut std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
@@ -332,14 +329,14 @@ fn collect_and_close_upvals<'a>(
 }
 
 fn collect_and_close_upvals_impl<'a>(
-    upvals: &[Rc<RefCell<UpVal<'a>>>],
+    upvals: &[UpValRef<'a>],
     state: &mut LuaState<'a>,
     result: &mut Vec<OpenUpvalInfo<'a>>,
     visited: &mut std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
     visited_tables: &mut std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
 ) {
     for uv_ref in upvals.iter() {
-        let ptr = Rc::as_ptr(uv_ref) as usize;
+        let ptr = SimpleRc::as_ptr(uv_ref) as usize;
         if !visited.insert(ptr) {
             continue;
         }
@@ -519,7 +516,7 @@ fn collect_wrap_upvals_info<'a>(
 
 /// 递归收集开 upvalue 信息（不关闭）
 fn collect_open_upvals_recursive<'a>(
-    upvals: &[Rc<RefCell<UpVal<'a>>>],
+    upvals: &[UpValRef<'a>],
     state: &LuaState<'a>,
     result: &mut Vec<(UpValRef<'a>, usize, TValue<'a>)>,
     visited: &mut std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
@@ -530,14 +527,14 @@ fn collect_open_upvals_recursive<'a>(
 }
 
 fn collect_open_upvals_recursive_impl<'a>(
-    upvals: &[Rc<RefCell<UpVal<'a>>>],
+    upvals: &[UpValRef<'a>],
     state: &LuaState<'a>,
     result: &mut Vec<(UpValRef<'a>, usize, TValue<'a>)>,
     visited: &mut std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
     visited_tables: &mut std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
 ) {
     for uv_ref in upvals.iter() {
-        let ptr = Rc::as_ptr(uv_ref) as usize;
+        let ptr = SimpleRc::as_ptr(uv_ref) as usize;
         if !visited.insert(ptr) {
             continue;
         }
@@ -760,7 +757,7 @@ fn close_yield_upvals<'a>(
             }
         };
         if is_open && !is_tbc {
-            let ptr = Rc::as_ptr(&uv_ref) as usize;
+            let ptr = SimpleRc::as_ptr(&uv_ref) as usize;
             if visited.insert(ptr) {
                 to_close.push((uv_idx, stack_index));
             }

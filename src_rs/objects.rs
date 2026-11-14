@@ -28,7 +28,7 @@ use std::hash::{Hash, Hasher};
 use crate::alloc::simple_arc_clone;
 use crate::alloc::{myrc_clone, simple_rc_clone, SimpleRc};
 use crate::config::{LuaInteger, LuaNumber, LuaUnsigned};
-use crate::mem::SlotAlloc;
+use crate::mem::{AllocFailed, SlotAlloc};
 use crate::strings::{
     lua_string_as_str, lua_string_eq, lua_string_hash, ArcRc, LongString, ShortString,
 };
@@ -215,7 +215,7 @@ pub fn tvalue_fx_hash(v: &TValue) -> u64 {
 
 /// 共享上值引用 —— 多个闭包可以共享同一个 UpVal（对应 C 中 UpVal 是堆分配对象）。
 /// 当 Open 上值被关闭时，所有持有该引用的闭包都能看到 Closed 状态。
-pub type UpValRef<'a> = Rc<RefCell<UpVal<'a>>>;
+pub type UpValRef<'a> = SimpleRc<RefCell<UpVal<'a>>, crate::mem::SlotAlloc>;
 
 /// Lua 类型标签 —— 使用 Rust enum 替代 C 的整数常量 + 位掩码
 ///
@@ -1526,7 +1526,7 @@ impl<'a> Clone for UpValVec<'a> {
     fn clone(&self) -> Self {
         let mut v = UpValVec::new();
         for x in self.iter() {
-            v.push(x.clone());
+            v.push_ref(x.clone());
         }
         v
     }
@@ -1562,7 +1562,16 @@ impl<'a> UpValVec<'a> {
         }
     }
 
-    pub fn push(&mut self, val: UpValRef<'a>) {
+    pub fn push_val(
+        &mut self,
+        state: &mut LuaState<'a>,
+        val: UpVal<'a>,
+    ) -> Result<(), VmError<'a>> {
+        self.push_ref(state.new_simple_object(RefCell::new(val))?);
+        return Ok(());
+    }
+
+    pub fn push_ref(&mut self, val: UpValRef<'a>) {
         if self.heap.is_none() && self.len as usize >= 4 {
             // 内联已满: 迁移到堆
             let mut v = Vec::with_capacity(8);
@@ -1625,7 +1634,7 @@ impl<'a> From<Vec<UpValRef<'a>>> for UpValVec<'a> {
         if v.len() <= 4 {
             let mut u = UpValVec::new();
             for x in v {
-                u.push(x);
+                u.push_ref(x);
             }
             u
         } else {

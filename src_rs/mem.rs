@@ -576,6 +576,26 @@ impl<'a> crate::state::LuaState<'a> {
         }
     }
 
+    pub fn new_simple_object<T: crate::alloc::RcPayload>(
+        &mut self,
+        value: T,
+    ) -> Result<crate::alloc::SimpleRc<T, SlotAlloc>, VmError<'a>> {
+        let slot = self.alloc_slot();
+        match crate::alloc::SimpleRc::try_new_in(slot, value) {
+            Ok(rc) => Ok(rc),
+            Err(value) => {
+                core::hint::cold_path();
+                if self.can_retry_alloc() {
+                    self.emergency_gc();
+                    if let Ok(rc) = crate::alloc::SimpleRc::try_new_in(slot, value) {
+                        return Ok(rc);
+                    }
+                }
+                Err(VmError::MemoryError)
+            }
+        }
+    }
+
     /// 建空表漏斗 —— 对应 C 的 `luaH_new`（块经 `luaM_newobject`）。
     pub fn new_table(&mut self) -> Result<crate::table::Table<'a>, VmError<'a>> {
         let slot = self.alloc_slot();

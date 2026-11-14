@@ -20,7 +20,7 @@
 //! - 标签 400+: 表库
 //! - 标签 500+: 调试库
 
-use crate::alloc::MyRc;
+use crate::alloc::{MyRc, SimpleRc};
 use crate::config::LuaInteger;
 use crate::execute::VmError;
 use crate::mem::SlotAlloc;
@@ -2410,7 +2410,7 @@ fn call_upvalueid<'a>(
             let upvals_ref = closure.upvals.borrow();
             if n > 0 && n <= upvals_ref.len() {
                 // 使用 Rc 的指针作为唯一标识
-                let ptr = Rc::as_ptr(&upvals_ref[n - 1]) as *mut std::ffi::c_void;
+                let ptr = SimpleRc::as_ptr(&upvals_ref[n - 1]) as *mut std::ffi::c_void;
                 push_single_result(state, a, nresults, TValue::LightUserData(ptr));
             } else {
                 push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
@@ -3603,9 +3603,14 @@ mod tests {
             source: None,
         };
         let mut upvals = UpValVec::new();
-        upvals.push(Rc::new(RefCell::new(UpVal::Closed {
-            value: TValue::Integer(42),
-        })));
+        upvals
+            .push_val(
+                &mut state,
+                UpVal::Closed {
+                    value: TValue::Integer(42),
+                },
+            )
+            .unwrap();
         let closure = MyRc::new_in(
             alloc.slot(),
             LClosure {
@@ -3831,9 +3836,14 @@ mod tests {
         use crate::gc::GCObjectHeader;
         let mut state = LuaState::default();
         let mut upvals = UpValVec::new();
-        upvals.push(Rc::new(RefCell::new(UpVal::Closed {
-            value: TValue::Integer(42),
-        })));
+        upvals
+            .push_val(
+                &mut state,
+                UpVal::Closed {
+                    value: TValue::Integer(42),
+                },
+            )
+            .unwrap();
         let closure = MyRc::new_in(
             alloc.slot(),
             LClosure {

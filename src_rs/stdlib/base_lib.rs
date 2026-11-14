@@ -2709,13 +2709,14 @@ fn call_load<'a>(
                 intern_proto_strings(&mut proto, state);
             }
             let mut upvals = UpValVec::new();
-            upvals.push(Rc::new(std::cell::RefCell::new(UpVal::Closed {
-                value: env_val,
-            })));
+            upvals.push_val(state, UpVal::Closed { value: env_val })?;
             for _ in 1..nup {
-                upvals.push(Rc::new(std::cell::RefCell::new(UpVal::Closed {
-                    value: TValue::Nil(NilKind::Strict),
-                })));
+                upvals.push_val(
+                    state,
+                    UpVal::Closed {
+                        value: TValue::Nil(NilKind::Strict),
+                    },
+                )?;
             }
             // new_closure 完成「构造 + 对象块分配 + GC 登记 + id 写回」。
             // 此前该路径未登记：闭包不计入 `gc_estimate`（GC 阈值/`collectgarbage("count")`
