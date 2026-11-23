@@ -958,6 +958,10 @@ impl<'a> LuaState<'a> {
 
     /// 保证 scratch 至少覆盖到当前帧写边界: 把 `[max(len, scratch_end), floor)` 填 Nil
     /// (不改变 Vector 逻辑长度 —— `len` 语义恒为精确 live top)。
+    ///
+    /// perf: 常见情形 (同一帧内反复调用 / 返回后回到已补齐的调用者帧) 无需填充,
+    /// 这里做内联的「是否需要填」判断, 避免每次都跳到 `#[cold]` 慢函数
+    /// (call/return 各一次, 都在热路径上)。
     #[inline(always)]
     pub fn pad_frame_scratch(&mut self) {
         debug_assert!(self.stack.len() <= self.stack.capacity());
@@ -969,7 +973,9 @@ impl<'a> LuaState<'a> {
         // (实测 `state.top = saved_top` 后 top=259 > floor=257, 于是 `truncate_live_vec`
         // 的 `stack[n..top]` 越界 panic)。
         let floor = self.frame_floor().max(self.top);
-        self.pad_frame_scratch_slow(floor);
+        if floor > self.stack.len() {
+            self.pad_frame_scratch_slow(floor);
+        }
     }
 
     /// 把 scratch 至少覆盖到 `end` (exclusive) —— 供动态长度写入使用

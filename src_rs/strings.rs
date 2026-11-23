@@ -26,15 +26,14 @@ use std::os::raw::{c_char, c_void};
 use crate::mem::Allocator;
 use crate::objects::TValue;
 
-/// LongString 的 allocator 槽指针：指向 `Box<dyn Allocator>` 的稳定地址
-/// （即 `&g.mem.allocator`，GlobalState 被 Box 持有 → 地址稳定；
-/// lua_setallocf 原地替换 Box 内容后自动跟随当前 allocator，
-/// 符合 C Lua「释放走当前 allocf」语义）。null 表示无 allocator
-/// （测试/构造期），回退 std::alloc。
+/// LongString 的 allocator 槽指针：指向 [`crate::mem::AllocDispatch`] 的稳定地址
+/// （直调表由 `AllocOwner` 在堆上独立分配 → 地址稳定；`lua_setallocf`
+/// 原地更新表项后自动跟随当前 allocator，符合 C Lua「释放走当前 allocf」语义）。
+/// 表项即「函数指针 + 实参」，每次分配只需一次间接调用（对应 C 的 `g->frealloc`）。
 ///
 /// 用 `*const`（而非 `*mut`）以便通过 `&self` 取得槽，避免与
 /// `&self.string_table` 的可变借用冲突（`Allocator::alloc` 已是 `&self`）。
-pub type AllocSlot = *const Box<dyn Allocator>;
+pub type AllocSlot = *const crate::mem::AllocDispatch;
 // ============================================================================
 // RwLock 抽象层 — 根据 `threaded` feature 切换实现
 // ============================================================================
@@ -1389,10 +1388,10 @@ mod tests {
         }
 
         let sizes = Rc::new(RefCell::new(Sizes::default()));
-        let boxed: Box<dyn Allocator> = Box::new(RecordingAllocator {
+        let owner = crate::mem::AllocOwner::new(Box::new(RecordingAllocator {
             sizes: Rc::clone(&sizes),
-        });
-        let slot = unsafe { SlotAlloc::from_slot(&boxed) };
+        }));
+        let slot = SlotAlloc::from_owner(&owner);
 
         // 常规长字符串：块 = 固定头 + 内容 + NUL
         let content = "a".repeat(100);
@@ -1830,10 +1829,10 @@ mod tests {
         }
 
         let counter = Rc::new(Cell::new(0usize));
-        let boxed: Box<dyn Allocator> = Box::new(CountingAllocator {
+        let owner = crate::mem::AllocOwner::new(Box::new(CountingAllocator {
             n: Rc::clone(&counter),
-        });
-        let slot = unsafe { SlotAlloc::from_slot(&boxed) };
+        }));
+        let slot = SlotAlloc::from_owner(&owner);
         let content = "a".repeat(100);
 
         // 分配走 allocator（nsize > osize: 0 → block_size）

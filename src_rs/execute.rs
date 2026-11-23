@@ -1396,7 +1396,11 @@ impl VmExecutor {
                 };
             }
 
-            assert!(
+            // 帧切换入口不变量: 当前指令流必须以上述返回指令结尾。
+            // perf: 原先用 release 断言, 每次 CALL/RETURN 后的 'outer 迭代都要
+            // 读 `state.code.last()` + 5 路 match; 该不变量只在调试/测试期需要,
+            // 改为 debug_assert 后热路径零成本。
+            debug_assert!(
                 match state.code.last().map(|i: &u32| opcodes::get_opcode(*i)) {
                     Some(OpCode::RETURN) => true,
                     Some(OpCode::RETURN0) => true,
@@ -1968,10 +1972,7 @@ impl VmExecutor {
                                 // 上界），再在「下一条指令不是 VARARGPREP」时 sync_live_top。
                                 // 不能在这里用调用前的 `lua_frame_ceiling` 抬升 —— 帧已切换
                                 // （被调 Lua 帧）或嵌套 VM（pcall / coroutine.resume）遗留旧
-                                // 上界，都会把 top 抬过头。实测 db.lua「multiple values x
-                                // hooks」`{f(table.unpack(...))}`: 这里按**调用者**帧上界把
-                                // 实参末尾抬高，紧跟的 VARARGPREP 按 top 算出多余的实参个数，
-                                // 于是返回整栈垃圾（#t = 96 而非 31）。
+                                // 上界，都会把 top 抬过头。
                                 continue 'outer;
                             }
                             Err(e) => Err(e),
@@ -5153,7 +5154,7 @@ impl VmExecutor {
         state.maybe_collect_gc();
         // TableData 块经 MemState allocator 分配（对应 C 的 luaM_new(L, Table)）
         let table = state.new_table_with_capacity(array_size, hash_size as usize)?;
-        state.register_table(&table)?;
+        state.register_fresh_table(&table)?;
         Self::write_stack_state(state, a, TValue::Table(table));
         state.pc += 1;
         Ok(())

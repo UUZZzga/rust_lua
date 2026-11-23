@@ -24,6 +24,59 @@ pub type LuaCAlloc = Option<
     ) -> *mut std::ffi::c_void,
 >;
 
+/// 热路径直调函数的签名：`(ud, ptr, old_size, new_size, align) -> ptr`。
+///
+/// 对应 C 的 `g->frealloc(g->ud, block, osize, nsize)` —— 一次间接调用即到达
+/// 真正的分配器（默认 `std::alloc` / 宿主 `lua_Alloc`），不再经
+/// `Box<dyn Allocator>` 的胖指针 + vtable 两层解引用。
+pub type DirectAllocFn = unsafe fn(*mut std::ffi::c_void, *mut u8, usize, usize, usize) -> *mut u8;
+
+/// 分配器直调表 — [`crate::strings::AllocSlot`] 指向它。
+///
+/// 槽因此保持 8 字节（对象块布局不变），每次分配只做
+/// 「load 槽 → load fn/ud → 一次间接调用」，与 C 的 `frealloc` 调用同形。
+#[repr(C)]
+pub struct AllocDispatch {
+    pub alloc: DirectAllocFn,
+    pub ud: *mut std::ffi::c_void,
+}
+
+/// 默认分配器的直调入口（`ud` 不使用）。
+unsafe fn default_alloc_direct(
+    _ud: *mut std::ffi::c_void,
+    ptr: *mut u8,
+    old_size: usize,
+    new_size: usize,
+    align: usize,
+) -> *mut u8 {
+    DefaultAllocator.alloc(ptr, old_size, new_size, align)
+}
+
+/// C API 分配器的直调入口（`ud` = 内层 `CapiAllocator` 的地址）。
+unsafe fn capi_alloc_direct(
+    ud: *mut std::ffi::c_void,
+    ptr: *mut u8,
+    old_size: usize,
+    new_size: usize,
+    align: usize,
+) -> *mut u8 {
+    // SAFETY: ud 由 `CapiAllocator::direct_alloc` 给出，指向存活的该类型值；
+    // `set_allocf` 原地改写字段，地址不变。
+    (*(ud as *const CapiAllocator)).alloc(ptr, old_size, new_size, align)
+}
+
+/// 任意自定义分配器的转发入口（`ud` = 堆上 `Box<dyn Allocator>` 的地址）。
+unsafe fn dynamic_alloc_direct(
+    ud: *mut std::ffi::c_void,
+    ptr: *mut u8,
+    old_size: usize,
+    new_size: usize,
+    align: usize,
+) -> *mut u8 {
+    // SAFETY: ud 由 [`AllocOwner`] 保证指向存活的 `Box<dyn Allocator>`。
+    (*(ud as *const Box<dyn Allocator>)).alloc(ptr, old_size, new_size, align)
+}
+
 pub trait Allocator {
     /// C 风格 realloc 语义：new_size==0 时释放并返回 NULL。
     /// `align` 为分配/释放的对齐要求（LongString 块为 8）；CapiAllocator
@@ -42,6 +95,15 @@ pub trait Allocator {
     /// CapiAllocator）。
     fn set_allocf(&mut self, _f: LuaCAlloc, _ud: *mut std::ffi::c_void) -> bool {
         false
+    }
+
+    /// 热路径直调入口 —— 返回 (函数指针, 实参)，供 [`AllocOwner`] 把槽拍平为
+    /// [`AllocDispatch`]。
+    ///
+    /// 默认 `None`：由宿主生成经 `Box<dyn Allocator>` 的动态转发（任意自定义
+    /// 分配器仍可用）。内置分配器覆盖此方法，使每次分配只剩一次间接调用。
+    fn direct_alloc(&self) -> Option<(DirectAllocFn, *mut std::ffi::c_void)> {
+        None
     }
 }
 
@@ -62,34 +124,63 @@ impl Allocator for Box<dyn Allocator> {
 }
 
 // ============================================================================
-// 默认分配器：基于 std::alloc
+// 默认分配器：直接调用平台 malloc/realloc/free（与 C 版 `l_alloc` 同一后端）
 // ============================================================================
 
 pub struct DefaultAllocator;
 
+/// 平台 malloc 的保证对齐（`max_align_t`）。超过此值回退 `std::alloc`。
+const MALLOC_MAX_ALIGN: usize = 16;
+
+/// 高对齐（> `max_align_t`）回退路径 —— 保留 std::alloc 的布局检查与对齐能力。
+fn std_alloc(ptr: *mut u8, old_size: usize, new_size: usize, align: usize) -> *mut u8 {
+    if new_size == 0 {
+        if old_size != 0 && !ptr.is_null() {
+            unsafe {
+                let layout = Layout::from_size_align_unchecked(old_size, align);
+                alloc::dealloc(ptr, layout);
+            }
+        }
+        return std::ptr::null_mut();
+    }
+
+    if ptr.is_null() || old_size == 0 {
+        let layout = match Layout::from_size_align(new_size, align) {
+            Ok(l) => l,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        unsafe { alloc::alloc(layout) }
+    } else {
+        let old_layout = unsafe { Layout::from_size_align_unchecked(old_size, align) };
+        unsafe { alloc::realloc(ptr, old_layout, new_size) }
+    }
+}
+
 /// 默认对齐：1 字节，用于非类型化分配（C 的 realloc 语义）。
 impl Allocator for DefaultAllocator {
-    fn alloc(&self, ptr: *mut u8, old_size: usize, new_size: usize, align: usize) -> *mut u8 {
-        if new_size == 0 {
-            if old_size != 0 && !ptr.is_null() {
-                unsafe {
-                    let layout = Layout::from_size_align_unchecked(old_size, align);
-                    alloc::dealloc(ptr, layout);
+    fn alloc(&self, ptr: *mut u8, _old_size: usize, new_size: usize, align: usize) -> *mut u8 {
+        if align > MALLOC_MAX_ALIGN {
+            return std_alloc(ptr, _old_size, new_size, align);
+        }
+        // SAFETY: malloc/realloc/free 满足 C 的 realloc 语义（new_size==0 释放）。
+        // 对齐 ≤ max_align_t 由平台 malloc 保证，与 C Lua 经 `l_alloc` 的行为一致。
+        unsafe {
+            if new_size == 0 {
+                if !ptr.is_null() {
+                    libc::free(ptr.cast());
                 }
+                std::ptr::null_mut()
+            } else if ptr.is_null() {
+                libc::malloc(new_size).cast()
+            } else {
+                libc::realloc(ptr.cast(), new_size).cast()
             }
-            return std::ptr::null_mut();
         }
+    }
 
-        if ptr.is_null() || old_size == 0 {
-            let layout = match Layout::from_size_align(new_size, align) {
-                Ok(l) => l,
-                Err(_) => return std::ptr::null_mut(),
-            };
-            unsafe { alloc::alloc(layout) }
-        } else {
-            let old_layout = unsafe { Layout::from_size_align_unchecked(old_size, align) };
-            unsafe { alloc::realloc(ptr, old_layout, new_size) }
-        }
+    #[inline]
+    fn direct_alloc(&self) -> Option<(DirectAllocFn, *mut std::ffi::c_void)> {
+        Some((default_alloc_direct, std::ptr::null_mut()))
     }
 }
 
@@ -145,6 +236,15 @@ impl Allocator for CapiAllocator {
         self.allocf_ud = ud;
         true
     }
+
+    #[inline]
+    fn direct_alloc(&self) -> Option<(DirectAllocFn, *mut std::ffi::c_void)> {
+        // ud = self 的地址：字段经 `set_allocf` 原地更新，地址不变。
+        Some((
+            capi_alloc_direct,
+            self as *const Self as *mut std::ffi::c_void,
+        ))
+    }
 }
 
 // ============================================================================
@@ -177,16 +277,16 @@ pub use std::vec::Vec as AllocVec;
 // （Vec/Box/HashTable）的适配器，把分配路由到分配器槽（AllocSlot）
 // ============================================================================
 
-/// 运行期分配器宿主：为 `Box<dyn Allocator>` 提供一个稳定地址。
+/// 运行期分配器宿主：为分配器提供一个稳定地址，并维护已拍平的直调表。
 ///
-/// 存在理由：分配器槽（[`crate::strings::AllocSlot`]）指向 `Box<dyn Allocator>`
-/// **值本身**。若该值内联在 `GlobalState::mem` 中，`GlobalState` 构造期还没有
+/// 存在理由：分配器槽（[`crate::strings::AllocSlot`]）指向 [`AllocDispatch`]。
+/// 若槽指向的这张表内联在 `GlobalState::mem` 中，`GlobalState` 构造期还没有
 /// 固定地址，就只能在构造期退化成 null 槽——而 null 槽意味着「类型上带了分配器
 /// 参数、运行时却回退 std::alloc」，与 allocator_api2 的参数化语义自相矛盾。
 ///
-/// 本类型把内层 Box 放在独立堆块上：槽自 [`Self::new`] 起即有效，
-/// `GlobalState` 装箱/移动不改变该地址；[`Self::set`] 原地替换内容后，
-/// 已发出的槽自动跟随。
+/// 本类型把直调表与内层 `Box<dyn Allocator>` 都放在独立堆块上：槽自
+/// [`Self::new`] 起即有效，`GlobalState` 装箱/移动不改变该地址；
+/// [`Self::set`] 原地替换内容并重算直调表后，已发出的槽自动跟随。
 ///
 /// # 为什么宿主是共享的（`Rc`）而不是各持一份
 ///
@@ -205,7 +305,7 @@ pub use std::vec::Vec as AllocVec;
 /// [`Self::set`] 原地替换内层值，所有持有者与已发出的槽一起跟随，语义与
 /// C 的 `g->frealloc` 一致。
 ///
-/// # 为什么持有根裸指针而不是 `Box<Box<dyn Allocator>>`
+/// # 为什么持有根裸指针而不是 `Box<...>`
 ///
 /// 若用 `Box` 持有内层值，`slot()` 只能写成 `&*self.inner as *const _` ——
 /// 一条**从共享引用派生**的地址。随后 [`Self::set`] 的原地写入会被 Tree
@@ -215,23 +315,42 @@ pub use std::vec::Vec as AllocVec;
 ///
 /// [`Box::into_raw`] 取得的是**根裸指针**，不派生自任何引用：读、写、以及
 /// `set` 原地覆盖都始终合法，且不会因其他访问而失效。所有权仍由宿主持有
-/// （[`AllocInner`] 的 `Drop`），内层值只回收一次（不是 `Box::leak`，无泄漏）。
+/// （[`AllocInner`] 的 `Drop`），内层值与直调表各只回收一次（不是
+/// `Box::leak`，无泄漏）。
 #[derive(Clone)]
 pub struct AllocOwner {
     /// 共享宿主内部（`Rc` 自身用 std 分配，不参与 Lua allocf 路由）。
     inner: Rc<AllocInner>,
 }
 
-/// 宿主内部：内层分配器 Box 的根裸指针 + 唯一回收点。
+/// 宿主内部：内层分配器 Box 的根裸指针 + 已拍平的直调表 + 唯一回收点。
 struct AllocInner {
     /// 指向堆上 `Box<dyn Allocator>` 的根裸指针（始终非 null）。
     ptr: NonNull<Box<dyn Allocator>>,
+    /// 已拍平的直调表（槽指向它），与内层 Box 分离分配以保证地址稳定。
+    dispatch: NonNull<AllocDispatch>,
+}
+
+impl AllocInner {
+    /// 由内层 Box 现算直调表（[`AllocOwner::new`] 与 [`AllocOwner::set`] 共用）。
+    ///
+    /// 内置分配器（默认 / C API）给出直调函数；其余自定义分配器退化为经
+    /// `Box<dyn Allocator>` 的动态转发（`ud` = 内层 Box 的地址）。
+    fn make_dispatch(ptr: NonNull<Box<dyn Allocator>>) -> AllocDispatch {
+        // SAFETY: ptr 来自 Box::into_raw，指向存活的 Box（调用方保证）。
+        let (alloc, ud) = unsafe { (*ptr.as_ptr()).direct_alloc() }
+            .unwrap_or((dynamic_alloc_direct, ptr.as_ptr() as *mut std::ffi::c_void));
+        AllocDispatch { alloc, ud }
+    }
 }
 
 impl Drop for AllocInner {
     fn drop(&mut self) {
-        // SAFETY: ptr 来自 Box::into_raw，是内层值的唯一所有权点，只回收一次。
-        unsafe { drop(Box::from_raw(self.ptr.as_ptr())) };
+        // SAFETY: 两个指针都来自 Box::into_raw，是各自值的唯一所有权点，只回收一次。
+        unsafe {
+            drop(Box::from_raw(self.ptr.as_ptr()));
+            drop(Box::from_raw(self.dispatch.as_ptr()));
+        }
     }
 }
 
@@ -239,11 +358,12 @@ impl AllocOwner {
     /// 接管一个分配器（内层 Box 立即获得稳定堆地址）。
     #[inline]
     pub fn new(allocator: Box<dyn Allocator>) -> Self {
+        let ptr =
+            NonNull::new(Box::into_raw(Box::new(allocator))).expect("Box::into_raw 不得返回 null");
+        let dispatch = NonNull::new(Box::into_raw(Box::new(AllocInner::make_dispatch(ptr))))
+            .expect("Box::into_raw 不得返回 null");
         Self {
-            inner: Rc::new(AllocInner {
-                ptr: NonNull::new(Box::into_raw(Box::new(allocator)))
-                    .expect("Box::into_raw 不得返回 null"),
-            }),
+            inner: Rc::new(AllocInner { ptr, dispatch }),
         }
     }
 
@@ -252,14 +372,18 @@ impl AllocOwner {
     /// 只做指针转换，**不创建对目标值的引用**（见类型级文档）。
     #[inline]
     pub fn slot(&self) -> crate::strings::AllocSlot {
-        self.inner.ptr.as_ptr() as *const Box<dyn Allocator>
+        self.inner.dispatch.as_ptr()
     }
 
     /// 原地替换分配器（槽地址不变，所有共享持有者与已发出的槽自动跟随）。
     #[inline]
     pub fn set(&mut self, allocator: Box<dyn Allocator>) {
         // SAFETY: 根裸指针非 null，且指向内层值的唯一所有权点；覆盖即析构旧值。
-        unsafe { *self.inner.ptr.as_ptr() = allocator };
+        // 直调表随即按新分配器重算（槽地址不变，读槽的热路径自动看到新值）。
+        unsafe {
+            *self.inner.ptr.as_ptr() = allocator;
+            *self.inner.dispatch.as_ptr() = AllocInner::make_dispatch(self.inner.ptr);
+        }
     }
 }
 
@@ -314,7 +438,7 @@ impl SlotAlloc {
     /// 从裸槽构造。
     ///
     /// # Safety
-    /// `slot` 必须非 null，且其指向的 `Box<dyn Allocator>` 必须在本分配器的
+    /// `slot` 必须非 null，且其指向的 [`AllocDispatch`] 必须在本分配器的
     /// **全部**使用期内保持有效（由 [`AllocOwner`] 或 `GlobalState::mem` 保证）。
     #[inline]
     pub unsafe fn from_slot(slot: crate::strings::AllocSlot) -> Self {
@@ -329,6 +453,9 @@ impl SlotAlloc {
     }
 
     /// 经槽分配/释放；`new_size == 0` 时释放并返回 null（C realloc 语义）。
+    ///
+    /// 槽指向已拍平的直调表：一次 load + 一次间接调用（对应 C 的
+    /// `g->frealloc(g->ud, ...)`）。
     #[inline]
     unsafe fn raw_realloc(
         &self,
@@ -337,7 +464,8 @@ impl SlotAlloc {
         new_size: usize,
         align: usize,
     ) -> *mut u8 {
-        (*self.0).alloc(ptr, old_size, new_size, align)
+        let d = &*self.0;
+        (d.alloc)(d.ud, ptr, old_size, new_size, align)
     }
 }
 
@@ -533,6 +661,7 @@ impl<'a> crate::state::LuaState<'a> {
     /// `op` 必须**可重复执行**且失败时不得留下部分写入：C 的分配原语失败时
     /// 解释器状态与调用前一致（`luaM_saferealloc_` 只在成功后才更新 `*psize`），
     /// 这里同样要求「先扩容再写入」（见 `Table::try_reserve_for` + `set_unchecked`）。
+    #[inline]
     pub fn retry_alloc<T>(
         &mut self,
         mut op: impl FnMut() -> Result<T, AllocFailed>,
@@ -556,6 +685,7 @@ impl<'a> crate::state::LuaState<'a> {
     ///
     /// `value` 在两次尝试之间交还给分配器（失败分支由 [`crate::alloc::MyRc::try_new_in`]
     /// 原样归还），因此没有额外克隆/构造开销。
+    #[inline]
     pub fn new_object<T: crate::alloc::RcPayload>(
         &mut self,
         value: T,
@@ -576,6 +706,7 @@ impl<'a> crate::state::LuaState<'a> {
         }
     }
 
+    #[inline]
     pub fn new_simple_object<T: crate::alloc::RcPayload>(
         &mut self,
         value: T,
@@ -870,10 +1001,10 @@ mod tests {
 
         // 经槽分配/释放可用（证明槽指向真实分配器）
         unsafe {
-            let boxed: &Box<dyn Allocator> = &*slot.slot();
-            let p = boxed.alloc(std::ptr::null_mut(), 0, 32, 8);
+            let d = &*slot.slot();
+            let p = (d.alloc)(d.ud, std::ptr::null_mut(), 0, 32, 8);
             assert!(!p.is_null());
-            let _ = boxed.alloc(p, 32, 0, 8);
+            let _ = (d.alloc)(d.ud, p, 32, 0, 8);
         }
     }
     /// `AllocOwner::set` 原地替换：槽地址不变（已发出的槽自动跟随新分配器）。

@@ -839,10 +839,10 @@ mod tests {
         }
 
         let counter = Rc::new(Cell::new(0usize));
-        let boxed: Box<dyn Allocator> = Box::new(CountingAllocator {
+        let owner = crate::mem::AllocOwner::new(Box::new(CountingAllocator {
             n: Rc::clone(&counter),
-        });
-        let slot = unsafe { SlotAlloc::from_slot(&boxed) };
+        }));
+        let slot = SlotAlloc::from_owner(&owner);
 
         let t = Table::new_in(slot);
         {

@@ -692,18 +692,27 @@ impl<'a> GCState<'a> {
             }
         }
 
-        // 优先重用已释放的 ID 槽位，避免 metas 数组无限增长
-        let id = if let Some(free_id) = objs.free_ids.pop() {
-            GCObjectId(free_id)
-        } else {
-            let id_val = self.next_id.get();
-            self.next_id.set(id_val + 1);
-            while objs.metas.len() <= id_val as usize {
-                objs.metas.push(None);
+        // 优先重用已释放的 ID 槽位，避免 metas 数组无限增长。
+        // 新 ID 路径：ID 单调递增、metas 与 next_id 同步增长 → 稠密，无需 while
+        // 补齐；直接 push 一次写入整个 `Some(meta)`（旧的 push(None)+赋值会写两遍）。
+        let id = match objs.free_ids.pop() {
+            Some(free_id) => {
+                objs.metas[free_id as usize] = Some(meta);
+                GCObjectId(free_id)
             }
-            GCObjectId(id_val)
+            None => {
+                let id_val = self.next_id.get();
+                self.next_id.set(id_val + 1);
+                // metas 以 ID 直接索引（ID 从 1 开始，0 号槽是占位）：补齐缺口后
+                // 一次性 push `Some(meta)`——稳态下 while 不执行，避免旧写法
+                // 「push(None) 再整体赋值」写两遍。
+                while objs.metas.len() < id_val as usize {
+                    objs.metas.push(None);
+                }
+                objs.metas.push(Some(meta));
+                GCObjectId(id_val)
+            }
         };
-        objs.metas[id.0 as usize] = Some(meta);
         objs.all_objects.push(id.0);
 
         let current = self.gc_debt.get();
@@ -734,6 +743,19 @@ impl<'a> GCState<'a> {
         if t.data.borrow().gc_header.id().is_some() {
             return Ok(());
         }
+        let id = self
+            .try_register_object(t.mem_size(), WeakValue::Table(t.downgrade()))
+            .map_err(|_| crate::mem::AllocFailed)?;
+        t.data.borrow().gc_header.set_id(id);
+        Ok(())
+    }
+
+    /// 登记一张**新建**表 —— 可失败（见 [`GCState::try_register_object`]）。
+    ///
+    /// 与 [`Self::try_register_table`] 的唯一区别：调用方保证该表刚由
+    /// `new_table*` 构造、必然未登记，因此省掉幂等检查那一趟 `data.borrow()`。
+    /// 对应 C 的 `luaC_newobj`（新对象无需判重）。
+    pub fn try_register_fresh_table(&self, t: &Table<'a>) -> Result<(), crate::mem::AllocFailed> {
         let id = self
             .try_register_object(t.mem_size(), WeakValue::Table(t.downgrade()))
             .map_err(|_| crate::mem::AllocFailed)?;
@@ -1267,6 +1289,23 @@ impl<'a> LuaState<'a> {
                 if self.can_retry_alloc() {
                     self.emergency_gc();
                     if unsafe { self.gc_mut() }.try_register_table(t).is_ok() {
+                        return Ok(());
+                    }
+                }
+                Err(VmError::MemoryError)
+            }
+        }
+    }
+
+    /// 登记**新建**表漏斗（见 [`LuaState::register_object`]）——
+    /// 用于 OP_NEWTABLE 等「刚构造、必然未登记」的热路径，省掉幂等检查。
+    pub fn register_fresh_table(&mut self, t: &crate::table::Table<'a>) -> Result<(), VmError<'a>> {
+        match unsafe { self.gc_mut() }.try_register_fresh_table(t) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                if self.can_retry_alloc() {
+                    self.emergency_gc();
+                    if unsafe { self.gc_mut() }.try_register_fresh_table(t).is_ok() {
                         return Ok(());
                     }
                 }
