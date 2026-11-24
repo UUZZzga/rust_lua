@@ -889,16 +889,15 @@ impl<'a> LuaState<'a> {
             return self.top;
         }
         let func = self.base - 1;
-        match self.stack.get(func) {
-            Some(TValue::LClosure(closure)) => {
-                // 同一帧的 ci 记录 (op_call / tailcall / VARARGPREP 维护 `ci.func`/`ci.top`)
-                if let Some(ci) = self.call_stack.last() {
-                    if ci.func == func && ci.top != 0 {
-                        return ci.top;
-                    }
-                }
-                func + 1 + closure.proto.max_stack_size as usize
+        // 快路径: 本帧自己的 CallFrame (`ci.func == base-1` 只可能是当前 Lua 帧的压帧),
+        // 命中时直接用 `ci.top`, 免去 `stack[func]` 的类型判别与 Proto 依赖链。
+        if let Some(ci) = self.call_stack.last() {
+            if ci.func == func && ci.top != 0 {
+                return ci.top;
             }
+        }
+        match self.stack.get(func) {
+            Some(TValue::LClosure(closure)) => func + 1 + closure.proto.max_stack_size as usize,
             // C 帧 (CClosure / LCFn / BuiltinFn / LightUserData) 或尚未进入帧:
             // C 帧的栈窗口天然在调用者活寄存器之上, 抬高 live top 会破坏
             // `lua_gettop` 等 C API 语义 —— 原值返回 (no-op)。
@@ -916,15 +915,21 @@ impl<'a> LuaState<'a> {
             return;
         }
         let func = base - 1;
-        // 只在当前帧**是 Lua 帧**时更新: C 帧 (BuiltinFn / CClosure 内联调用) 期间
-        // 字段必须保持「最内层 Lua 帧」的上界 —— `adjust_*` / `op_return*` 正是在
-        // C 帧里替 Lua 调用者收尾, 需要靠它复原 live top。
+        // 快路径: 本帧自己的 CallFrame 记录 (op_call / tailcall / VARARGPREP 维护) 就在栈顶 ——
+        // 命中时只用 `ci.top`, 完全不碰 `stack[func]` (省掉一次大概率 cache miss 的
+        // 16B TValue 读 + Rc→Proto 依赖链; profile 中本函数 CPI≈0.95 正是这条链)。
+        // 栈顶帧的 `func == base-1` 只可能来自本帧的 Lua 调用压帧, 故无需再验类型。
+        if let Some(ci) = self.call_stack.last() {
+            if ci.func == func && ci.top != 0 {
+                self.lua_frame_ceiling = ci.top;
+                return;
+            }
+        }
+        // 慢路径 (仅入口帧 / C 帧嵌套): 只在当前帧**是 Lua 帧**时更新: C 帧
+        // (BuiltinFn / CClosure 内联调用) 期间字段必须保持「最内层 Lua 帧」的上界 ——
+        // `adjust_*` / `op_return*` 正是在 C 帧里替 Lua 调用者收尾, 需要靠它复原 live top。
         if let Some(TValue::LClosure(c)) = self.stack.get(func) {
-            let fsize = func + 1 + c.proto.max_stack_size as usize;
-            self.lua_frame_ceiling = match self.call_stack.last() {
-                Some(ci) if ci.func == func && ci.top != 0 => ci.top,
-                _ => fsize,
-            };
+            self.lua_frame_ceiling = func + 1 + c.proto.max_stack_size as usize;
         }
     }
 

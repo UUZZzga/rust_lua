@@ -122,17 +122,12 @@ fn new_upval<'a>(
     let mut next: Option<usize> = None;
     match prev {
         Some(p_idx) => {
-            {
-                let p_ref = upval_slot(state, p_idx).expect("prev upvalue slot must be live");
-                if let UpVal::Open { next: p_next, .. } = &*p_ref.borrow() {
-                    next = *p_next;
-                }
-            }
-            {
-                let p_ref = upval_slot(state, p_idx).expect("prev upvalue slot must be live");
-                if let UpVal::Open { ref mut next, .. } = &mut *p_ref.borrow_mut() {
-                    *next = Some(uv_idx);
-                }
+            let p_ref = upval_slot(state, p_idx).expect("prev upvalue slot must be live");
+            // 同一趟借用内读完再改写: 旧写法先 borrow 读 p_next、再 borrow_mut 写,
+            // 白跑一次借阅检查 + 一次链表节点 load。
+            if let UpVal::Open { next: p_next, .. } = &mut *p_ref.borrow_mut() {
+                next = *p_next;
+                *p_next = Some(uv_idx);
             }
         }
         None => {
@@ -180,32 +175,74 @@ fn new_upval<'a>(
 
 pub fn close_upval(state: &mut LuaState, uv_idx: usize) {
     unsafe { state.gc_mut().cond_gc() };
-    // 槽位空闲（重复关闭 / 陈旧索引）→ 无操作
-    let uv_ref = match upval_slot(state, uv_idx) {
-        Some(r) => r.clone(),
+    // 槽位空闲（重复关闭 / 陈旧索引）→ 无操作。
+    // 直接 **take** 出强引用（而不是 clone）：本函数即将归还 arena 槽位，
+    // 多一次 Rc 计数增减纯属浪费（close 是每轮循环都走的路径）。
+    let uv_ref = match state
+        .open_upvals
+        .get_mut(uv_idx)
+        .and_then(|slot| slot.take())
+    {
+        Some(r) => r,
         None => return,
     };
-    let val = {
-        let uv_ref = uv_ref.borrow();
-        match &*uv_ref {
-            UpVal::Open { stack_index, .. } => state
-                .stack
-                .get(*stack_index)
-                .cloned()
-                .unwrap_or(TValue::Nil(NilKind::Strict)),
-            UpVal::Closed { value } => value.clone(),
+    let (prev_idx, next_idx);
+    {
+        let mut cell = uv_ref.borrow_mut();
+        let (stack_index, p, n) = match &*cell {
+            UpVal::Open {
+                stack_index,
+                next,
+                previous,
+                ..
+            } => (*stack_index, *previous, *next),
+            // 已关闭（不应出现在 arena 里；防御）
+            UpVal::Closed { .. } => {
+                drop(cell);
+                state.free_upvals.push(uv_idx);
+                return;
+            }
+        };
+        prev_idx = p;
+        next_idx = n;
+        let val = state
+            .stack
+            .get(stack_index)
+            .cloned()
+            .unwrap_or(TValue::Nil(NilKind::Strict));
+        // GC barrier: when upvalue is closed, mark the value
+        if let Some(gc_id) = crate::vm::gc_id_of_tvalue(&val) {
+            // 不能在这里借 state.gc_mut()：`cell` 是 RefMut，与 state 无关，安全。
+            unsafe { state.gc_mut().mark_object(gc_id) };
         }
-    };
-    // GC barrier: when upvalue is closed, mark the value
-    if let Some(gc_id) = crate::vm::gc_id_of_tvalue(&val) {
-        unsafe { state.gc_mut().mark_object(gc_id) };
+        // 关闭值写入共享 cell：持有该 upvalue 的闭包可见 Closed 值
+        *cell = UpVal::Closed { value: val };
     }
-    unlink_upval(state, uv_idx);
-    // 关闭值写入共享 cell：持有该 upvalue 的闭包可见 Closed 值
-    *uv_ref.borrow_mut() = UpVal::Closed { value: val };
-    // 归还 arena 强引用与槽位 —— 关闭后的 upvalue 仅由引用它的闭包维持存活。
-    // 对应 C 的 luaF_close：closed upvalue 不再是 openupval 链表节点，内存由 GC 回收。
-    state.open_upvals[uv_idx] = None;
+    // 就地摘链（邻居索引已在上面同一趟借用中读出，免去 unlink_upval 的再次借阅）
+    match prev_idx {
+        Some(p_idx) => {
+            if let Some(p_ref) = upval_slot(state, p_idx) {
+                if let UpVal::Open { ref mut next, .. } = &mut *p_ref.borrow_mut() {
+                    *next = next_idx;
+                }
+            }
+        }
+        None => {
+            state.open_upval = next_idx;
+        }
+    }
+    if let Some(n_idx) = next_idx {
+        if let Some(n_ref) = upval_slot(state, n_idx) {
+            if let UpVal::Open {
+                ref mut previous, ..
+            } = &mut *n_ref.borrow_mut()
+            {
+                *previous = prev_idx;
+            }
+        }
+    }
+    // 归还槽位 —— 关闭后的 upvalue 仅由引用它的闭包维持存活
+    // (对应 C 的 luaF_close：closed upvalue 不再是 openupval 链表节点，内存由 GC 回收)
     state.free_upvals.push(uv_idx);
 }
 
@@ -260,28 +297,32 @@ pub fn close<'a>(
     // 快速路径 (无 TBC 上值): 就地关闭, 避免 to_close Vec 分配。
     // 先第一趟检查是否有 TBC — 有 TBC 时必须走慢路径 (保持 __close yield 时
     // 剩余 upvalue 不提前关闭的顺序语义)。
-    let mut current = state.open_upval;
+    // `tbc_list` 仅在分配 TBC 上值时置位，它为空即可断定首趟扫描必然找不到 TBC，
+    // 直接跳过首趟（每轮循环都会走 OP_CLOSE，省一次链表遍历）。
     let mut found_tbc = false;
-    while let Some(uv_idx) = current {
-        let (should_close, next, is_tbc) = match upval_slot(state, uv_idx) {
-            Some(uv_ref) => {
-                let uv_ref = uv_ref.borrow();
-                match &*uv_ref {
-                    UpVal::Open {
-                        stack_index,
-                        next,
-                        tbc,
-                        ..
-                    } => (*stack_index >= level, *next, *tbc),
-                    UpVal::Closed { .. } => (false, None, false),
+    if state.tbc_list.is_some() {
+        let mut current = state.open_upval;
+        while let Some(uv_idx) = current {
+            let (should_close, next, is_tbc) = match upval_slot(state, uv_idx) {
+                Some(uv_ref) => {
+                    let uv_ref = uv_ref.borrow();
+                    match &*uv_ref {
+                        UpVal::Open {
+                            stack_index,
+                            next,
+                            tbc,
+                            ..
+                        } => (*stack_index >= level, *next, *tbc),
+                        UpVal::Closed { .. } => (false, None, false),
+                    }
                 }
+                None => (false, None, false),
+            };
+            if should_close && is_tbc {
+                found_tbc = true;
             }
-            None => (false, None, false),
-        };
-        if should_close && is_tbc {
-            found_tbc = true;
+            current = next;
         }
-        current = next;
     }
 
     if !found_tbc {
