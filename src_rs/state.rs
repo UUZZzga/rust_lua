@@ -2954,6 +2954,9 @@ impl<'a> LuaState<'a> {
         // 不做这一步，这类环会一直留到进程退出（LSan 报泄漏）。
         // 对应 C 的 lua_close → luaC_freeallobjects 的「关闭即释放全部」语义。
         self.collect_gc();
+        // GC 时间统计汇总（LUA_GC_STATS=1 时输出）—— 统计随 VM 归属，故在此
+        //（G 仍存活）打印；对应原 cli 里 close_state 之后的调用。
+        crate::gc::print_gc_time_summary(self.g());
         if let Some(code) = self.exit_requested {
             std::process::exit(code);
         }
@@ -3054,6 +3057,20 @@ pub struct GlobalState<'a> {
     pub tick: std::cell::Cell<u64>,
     pub twups_linked: bool,
     pub is_in_twups: bool,
+    /// `__close` 元方法链的嵌套深度 —— 对应 tm.rs `call_close_method` 的递归深度。
+    ///
+    /// 放**全局状态**（每个 VM 一份，所有协程共享）而非线程局部：`__close` 链
+    /// 可跨协程递归（cstack.lua 的链式 `coroutine.close` 用例），Rust 栈深度也
+    /// 跨执行态累加；线程局部在「同一 VM 换线程执行」时会把深度泄漏到别的线程
+    ///（误报 C stack overflow），多 VM 同线程时又会相互叠加。
+    pub close_depth: usize,
+    /// GC 诊断统计（LUA_GC_STATS=1）—— 归属本 VM 而非线程：同线程多个 VM
+    /// 时各记各的，同一 VM 换线程执行也不会分片/丢失。
+    pub gc_stats: std::cell::Cell<crate::gc::GcTypeStats>,
+    pub gc_trigger_stats: std::cell::Cell<crate::gc::GcTriggerStats>,
+    pub gc_time_stats: std::cell::Cell<crate::gc::GcTimeStats>,
+    /// 短串附加占用估算缓存（key: 字符串表地址 + 数量）—— 归属本 VM。
+    pub str_extra_cache: std::cell::Cell<(usize, usize, usize)>,
 
     // 公用字段
     pub gc: NonNull<GCState<'a>>,
@@ -3127,6 +3144,10 @@ pub struct GlobalState<'a> {
     /// 存储 Rc<Udata> 而非 Udata 深拷贝：确保 __gc 在原始 userdata 上调用，
     /// 这样 C 模块（如 lsqlite3）能通过 light userdata 指针正确清理 registry 引用
     pub ud_finobj_list: Rc<RefCell<Vec<MyRc<crate::objects::Udata<'a>, SlotAlloc>>>>,
+    /// finobj_list / ud_finobj_list 的长度缓存 — `maybe_collect_gc` 每次对象
+    /// 创建都调用 `finobj_has_garbage`，用 Cell 直读（无 RefCell borrow）做
+    /// O(1) 快路径：两个列表都为空时零成本返回。
+    pub finobj_counts: std::cell::Cell<(usize, usize)>,
     /// 状态正在关闭 — 对应 C 的 g->gcstp & GCSTPCLS
     /// true 时不再注册新的 finalizer 对象（close 中创建的对象不会被 finalize）
     pub gc_closing: bool,
@@ -3589,6 +3610,8 @@ impl<'a> GlobalState<'a> {
         let global_state: Rc<RefCell<GlobalShared<'a>>> =
             Rc::new(RefCell::new(GlobalShared::new(alloc.clone())));
         let gs = &mut global_state.borrow_mut();
+        // GCState 地址自此稳定 —— 绑定所有权指针（引用计数死亡的提前注销）
+        gs.gc.bind_owner_ptr();
         // 引导期（尚无 lua_State）：失败即返回 AllocFailed，由调用方决定
         // （对应 C 的 lua_newstate 在分配失败时返回 NULL，不做紧急回收）。
         let globals = {
@@ -3617,6 +3640,11 @@ impl<'a> GlobalState<'a> {
             tick: std::cell::Cell::new(0),
             twups_linked: false,
             is_in_twups: false,
+            close_depth: 0,
+            gc_stats: std::cell::Cell::new(crate::gc::GcTypeStats::ZERO),
+            gc_trigger_stats: std::cell::Cell::new(crate::gc::GcTriggerStats::ZERO),
+            gc_time_stats: std::cell::Cell::new(crate::gc::GcTimeStats::ZERO),
+            str_extra_cache: std::cell::Cell::new((0, 0, 0)),
             gc: NonNull::new(&mut gs.gc).unwrap(),
             globals,
             registry,
@@ -3652,6 +3680,7 @@ impl<'a> GlobalState<'a> {
             concat_gc_interval: std::cell::Cell::new(32768),
             finobj_list: Rc::new(RefCell::new(Vec::new())),
             ud_finobj_list: Rc::new(RefCell::new(Vec::new())),
+            finobj_counts: std::cell::Cell::new((0, 0)),
             gc_closing: false,
             exit_requested: None,
             cached_mode_key: std::cell::RefCell::new(None),
@@ -3698,6 +3727,9 @@ impl<'a> LuaState<'a> {
             (shared.alloc.clone(), shared.alloc_slot())
         };
         let mut gs = global_state.borrow_mut();
+        // GCState 地址稳定（Rc 堆块）—— 绑定死亡通知槽；幂等（共享块可被
+        // 多个执行态经 from_proto 反复进入）。
+        gs.gc.bind_owner_ptr();
         if base > 0 {
             while stack.len() < base {
                 stack.push(TValue::Nil(NilKind::Strict));
@@ -3733,6 +3765,11 @@ impl<'a> LuaState<'a> {
             tick: std::cell::Cell::new(0),
             twups_linked: false,
             is_in_twups: false,
+            close_depth: 0,
+            gc_stats: std::cell::Cell::new(crate::gc::GcTypeStats::ZERO),
+            gc_trigger_stats: std::cell::Cell::new(crate::gc::GcTriggerStats::ZERO),
+            gc_time_stats: std::cell::Cell::new(crate::gc::GcTimeStats::ZERO),
+            str_extra_cache: std::cell::Cell::new((0, 0, 0)),
             gc: NonNull::new(&mut gs.gc).unwrap(),
             globals,
             registry,
@@ -3767,6 +3804,7 @@ impl<'a> LuaState<'a> {
             concat_gc_interval: std::cell::Cell::new(32768),
             finobj_list: Rc::new(RefCell::new(Vec::new())),
             ud_finobj_list: Rc::new(RefCell::new(Vec::new())),
+            finobj_counts: std::cell::Cell::new((0, 0)),
             gc_closing: false,
             exit_requested: None,
             cached_mode_key: std::cell::RefCell::new(None),
@@ -3837,6 +3875,7 @@ impl<'a> GlobalState<'a> {
         self.registry.clear_for_drop();
 
         // 其他可能持有 Table 的字段也逐一处理，视实际需要补。
+        self.finobj_counts.set((0, 0));
         self.finobj_list.borrow_mut().clear();
         // weak_tables / ud_finobj_list / main_thread 里的 Table 由后续 collect_gc 清扫。
         // 外部字符串（lua_pushexternalstring）的调用方缓冲区不在此释放：其所有权

@@ -87,6 +87,20 @@ fn reserve_hash_slot<'a>(
 // Table 方法实现
 // ============================================================================
 
+impl<'a> Drop for Table<'a> {
+    #[inline]
+    fn drop(&mut self) {
+        // 最后一个 strong 句柄销毁 → 引用计数死亡：若已注册则提前注销 meta，
+        // 块随 data（MyRc）字段析构的 weak 释放立即回收，无需等待 sweep。
+        // strong>1 时只是普通克隆销毁，无操作（仅一次计数读取）。
+        // 注意：此时不得 borrow TableData —— 死亡可能正发生在 borrow_mut 的
+        // 旧值 drop 点；notify_table_death 走裸地址读 gc_header。
+        if self.data.strong_count() == 1 {
+            crate::objects::notify_table_death(&self.data);
+        }
+    }
+}
+
 impl<'a> Table<'a> {
     /// 创建空表 — TableData 块（header + 数据）由 `alloc_slot` 指向的
     /// MemState allocator 分配/释放。数组/哈希缓冲区与 key_to_bucket 索引

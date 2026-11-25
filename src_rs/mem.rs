@@ -827,11 +827,11 @@ impl<'a> crate::state::LuaState<'a> {
         // 元表在分配成功后写入（失败路径不会消耗它）
         unsafe { Udata::metatable_of(ud.as_raw_ptr()).replace(metatable) };
         // 用整块大小计费（含 header / 分配器槽 / 用户值 / 数据区）
-        let id = self.register_object(
+        let _id = self.register_object(
+            &ud.gc_header,
             ud.gc_mem_size(),
             crate::objects::WeakValue::UserData(ud.downgrade()),
         )?;
-        ud.gc_header.set_id(id);
         Ok(ud)
     }
 
@@ -850,11 +850,11 @@ impl<'a> crate::state::LuaState<'a> {
             upvals: std::cell::RefCell::new(upvals),
         })?;
         // 用 gc_mem_size() 计费含 upvals 容量，比 size_of::<LClosure>() 更接近真实占用
-        let id = self.register_object(
+        let _id = self.register_object(
+            &closure.gc_header,
             closure.gc_mem_size(),
             crate::objects::WeakValue::LClosure(closure.downgrade()),
         )?;
-        closure.gc_header.set_id(id);
         Ok(closure)
     }
 

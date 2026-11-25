@@ -1390,6 +1390,50 @@ impl<'a> TableDataRc<'a> {
     }
 }
 
+/// `RefCell<TableData>` 中 value 字段（= `TableData` 首字段 `gc_header`）的偏移。
+///
+/// repr(Rust) 字段序不做保证，offset_of! 又不越过私有字段 —— 故在首次注册表
+/// 时用真实地址差实测并存入本原子量。该偏移是**类型布局常量**（同一线程/VM/
+/// 进程内恒等），放进程级 `AtomicUsize` 而非 thread_local：避免每个线程各测
+/// 一份（值相同，纯冗余），也让跨线程创建的表能复用同一结果。
+/// usize::MAX = 尚未测量（此时跳过提前注销，退化为 sweep 延迟释放）。
+static TABLE_VALUE_OFF: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// 当前实测的 `gc_header` 偏移（usize::MAX = 尚未测量）。
+pub(crate) fn table_value_off() -> usize {
+    TABLE_VALUE_OFF.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 注册路径测量真实偏移（try_register_table 调用，此时 borrow 合法）。
+pub(crate) fn measure_table_value_off(payload: *const u8, header: &GCObjectHeader) {
+    let off = (header as *const GCObjectHeader as usize) - (payload as usize);
+    match TABLE_VALUE_OFF.compare_exchange(
+        usize::MAX,
+        off,
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    ) {
+        Ok(_) => debug_assert!(off < std::mem::size_of::<RefCell<TableData<'static>>>()),
+        Err(prev) => debug_assert_eq!(prev, off, "同一类型布局的 gc_header 偏移必须一致"),
+    }
+}
+
+/// 表的引用计数死亡通知 —— `gc_header` 在 `TableData` 首字段，位于 `RefCell`
+/// 的 value 偏移处。**不得**经 `data.borrow()` 读取：死亡可能正发生在
+/// TableData 已被 `borrow_mut` 的赋值点（旧值 drop 即死亡），借用会 panic。
+pub(crate) fn notify_table_death(data: &TableDataRc<'_>) {
+    let off = table_value_off();
+    if off == usize::MAX {
+        return;
+    }
+    let payload = data.as_raw_ptr();
+    // SAFETY: 表块此刻仍存活（strong 尚未释放），gc_header 位于 value 起始处
+    //（偏移由注册路径实测）；仅读取 Cell 字段，无并发写入。
+    let hdr = unsafe { &*(payload.add(off) as *const GCObjectHeader) };
+    crate::gc::notify_gc_death(hdr);
+}
+
 // ============================================================================
 // 规约：函数类型
 // ============================================================================
@@ -1411,6 +1455,15 @@ pub struct LClosure<'a> {
     /// 因此对 upvals 的修改（如 `debug.upvaluejoin`）对所有引用可见 ——
     /// 与 C 中 Closure 是堆分配对象、栈上存 `Closure*` 指针的语义一致。
     pub upvals: RefCell<UpValVec<'a>>,
+}
+
+impl<'a> Drop for LClosure<'a> {
+    #[inline]
+    fn drop(&mut self) {
+        // 引用计数死亡（strong→0）时的提前注销：meta 清除后块随本次 MyRc::drop
+        // 的 weak 释放立即回收（热缓存），无需等到 sweep。
+        crate::gc::notify_gc_death(&self.gc_header);
+    }
 }
 
 /// C 闭包 —— C 函数 + 捕获的上值
@@ -2100,6 +2153,9 @@ unsafe impl<'a> crate::alloc::RcPayload for Udata<'a> {
     }
 
     unsafe fn drop_payload(payload: *mut u8) {
+        // 引用计数死亡提前注销（gc_header 是 Udata 首字段，位于 payload 偏移 0；
+        // 必须在析构任何字段之前调用）。
+        crate::gc::notify_gc_death(&*(payload as *const crate::gc::GCObjectHeader));
         // 固定头（GCObjectHeader / nuvalue / len 无析构）+ 元表 + 各用户值。
         // 数据区（u64）无析构。
         std::ptr::drop_in_place(payload.add(Self::MT_OFF) as *mut RefCell<Option<Table<'a>>>);

@@ -135,7 +135,9 @@ pub(crate) struct GCObjectMeta<'a> {
     pub size: u32,
     pub color: GCColor,
     pub age: GCAge,
-    #[allow(dead_code)]
+    /// 已执行过 finalizer 的标志 — finalizer 中 remark 自己的对象（重新注册回
+    /// finobj_list 且永为 strong==1）据此被 finobj 扫描跳过，防止反复触发周期。
+    /// 新注册对象经 `GCObjectMeta::new` 天然为 false；对象死亡时 meta 一并清除。
     pub finalized: bool,
     #[allow(dead_code)]
     pub traversed: bool,
@@ -161,12 +163,22 @@ impl<'a> GCObjectMeta<'a> {
 #[derive(Debug, Clone)]
 pub struct GCObjectHeader {
     id: Cell<Option<NonZeroU32>>,
+    /// 所属 GCState 的地址（null = 未绑定 / 已失效）。
+    ///
+    /// 直接存指针，**不用** thread_local 槽表：槽号在线程局部表里分配，会让
+    /// 「同线程多个 VM」「同一 VM 跨线程执行」两种场景相互错配 —— 线程 B 上
+    /// 新建的 VM 会复用线程 A 的槽号，于是 A 的对象在线程 B 死亡时被解引用成
+    /// B 的 GCState，清除掉 B 中完全无关的 meta（跨 VM 状态破坏）。
+    /// 指针方案下失效判定只依赖「GCState 析构时把存活对象的 owner 置空」
+    ///（见 `impl Drop for GCState`），与线程数、VM 数均无关。
+    owner: Cell<*const u8>,
 }
 
 impl GCObjectHeader {
     pub fn new() -> Self {
         GCObjectHeader {
             id: Cell::new(None),
+            owner: Cell::new(std::ptr::null()),
         }
     }
 
@@ -177,11 +189,104 @@ impl GCObjectHeader {
     pub fn set_id(&self, id: GCObjectId) {
         self.id.set(Some(NonZeroU32::new(id.0).unwrap()));
     }
+
+    #[inline]
+    pub fn owner_ptr(&self) -> *const u8 {
+        self.owner.get()
+    }
+
+    #[inline]
+    pub fn set_owner_ptr(&self, ptr: *const u8) {
+        self.owner.set(ptr);
+    }
 }
 
 impl Default for GCObjectHeader {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ============================================================================
+// 引用计数死亡 —— 提前注销（早释放机制）
+// ============================================================================
+
+/// 引用计数死亡（strong→0）时的提前注销 —— 由 GC 注册对象的 payload 析构调用。
+///
+/// 调用时机（[`MyRc::drop`] 内，strong 已减至 0、weak 尚含内部份额）：
+/// meta 被同步清除后 weak 归零，本次 `MyRc::drop` 的 weak 释放路径即回收块
+/// （热缓存），无需等到 sweep。id/owner 未登记时为无操作。
+///
+/// 正确性不变式：meta 提前清除 ⇒ strong 已为 0 ⇒ 任何位置都不存在该对象的
+/// strong 句柄（TValue），故无悬垂解引用；仅存的弱引用（weak_tables 登记表）
+/// 经 upgrade 判活，安全。
+///
+/// 归属信息直接取自 `header.owner`（GCState 指针），不经线程局部注册表 ——
+/// 对象在哪个线程、哪个 VM 的上下文中死亡都能找到正确的所有者。
+pub(crate) fn notify_gc_death(header: &GCObjectHeader) {
+    notify_gc_death_impl(header);
+}
+
+fn notify_gc_death_impl(header: &GCObjectHeader) {
+    let Some(id) = header.id() else { return };
+    let owner = header.owner_ptr();
+    if owner.is_null() {
+        // 未绑定（GCState 构造期）或已失效（GCState 已析构）→ 退化为 sweep
+        return;
+    }
+    // SAFETY: owner 非空 ⇒ GCState 存活且地址稳定（析构时会把存活对象的
+    // owner 置空，故此后再无人能经失效指针访问）。
+    unsafe { early_unregister(owner, id.0) };
+}
+
+/// 清除一个已死对象的 meta。objects RefCell 被占用（sweep 借用整个循环）时
+/// 挂到**该 GCState 自己的** `pending_deaths`，由 `drain_pending_deaths` 在
+/// 安全点排空（meta 保留 → sweep 兜底）。
+unsafe fn early_unregister(owner: *const u8, id32: u32) {
+    // 生命周期擦除：仅访问与 'a 无关的字段（objects / gc_estimate / pending_deaths）。
+    let gc: &GCState<'static> = &*(owner as *const GCState<'static>);
+    match gc.objects.try_borrow_mut() {
+        Ok(mut objs) => GCState::early_unregister_locked(&mut objs, id32, &gc.gc_estimate),
+        Err(_) => {
+            // pending_deaths 与 objects 是不同的 RefCell；两次借用都失败
+            //（只可能发生在嵌套 drain 中）时丢弃 —— meta 保留，sweep 兜底。
+            if let Ok(mut p) = gc.pending_deaths.try_borrow_mut() {
+                p.push(id32);
+            }
+        }
+    }
+}
+
+/// 从一个 meta 的弱引用取到对象头并执行 `f`。
+///
+/// 弱引用 upgrade 出的强句柄在 `f` 返回后释放，因此 `f` 内只做 `Cell` 写入
+///（不得把 `&GCObjectHeader` 带出闭包）。upgrade 得到的临时 Rc 在 `f` 之后
+/// drop —— 若那一刻 strong 归零，`notify_gc_death` 读到的 owner 已被置空，
+/// 安全退化。
+unsafe fn with_header_of_weak<R>(
+    wv: &WeakValue<'_>,
+    f: impl FnOnce(&GCObjectHeader) -> R,
+) -> Option<R> {
+    match wv {
+        WeakValue::Table(w) => {
+            let t = w.upgrade()?;
+            let off = crate::objects::table_value_off();
+            if off == usize::MAX {
+                // 偏移尚未实测（从未注册过表）→ 无从定位 header
+                return None;
+            }
+            let hdr = &*(t.data.as_raw_ptr().add(off) as *const GCObjectHeader);
+            Some(f(hdr))
+        }
+        WeakValue::LClosure(w) => {
+            let c = w.upgrade()?;
+            Some(f(&c.gc_header))
+        }
+        WeakValue::UserData(w) => {
+            let u = w.upgrade()?;
+            Some(f(&u.gc_header))
+        }
+        _ => None,
     }
 }
 
@@ -207,7 +312,7 @@ pub struct GcTypeStats {
 }
 
 impl GcTypeStats {
-    const ZERO: Self = GcTypeStats {
+    pub(crate) const ZERO: Self = GcTypeStats {
         table: 0,
         table_with_mt: 0,
         lclosure: 0,
@@ -224,10 +329,6 @@ impl GcTypeStats {
     };
 }
 
-thread_local! {
-    static GC_STATS: Cell<GcTypeStats> = const { Cell::new(GcTypeStats::ZERO) };
-}
-
 pub fn gc_stats_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
@@ -238,48 +339,46 @@ pub fn gc_stats_enabled() -> bool {
     })
 }
 
+/// 统计累加 —— 计数存放于 `GlobalState`（每 VM 一份），不用 thread_local：
+/// 线程局部会把同线程多个 VM 的统计混在一起、并在 VM 换线程时丢片。
 #[inline]
-fn gc_stats_inc<F: FnOnce(&mut GcTypeStats)>(f: F) {
+fn gc_stats_inc<'a, F: FnOnce(&mut GcTypeStats)>(g: &GlobalState<'a>, f: F) {
     if !gc_stats_enabled() {
         return;
     }
-    GC_STATS.with(|cell| {
-        let mut s = cell.get();
-        f(&mut s);
-        cell.set(s);
-    });
+    let mut s = g.gc_stats.get();
+    f(&mut s);
+    g.gc_stats.set(s);
 }
 
-fn reset_gc_type_stats() {
-    GC_STATS.with(|cell| {
-        let mut s = cell.get();
-        s.table = 0;
-        s.table_with_mt = 0;
-        s.lclosure = 0;
-        s.lclosure_with_upvals = 0;
-        s.cclosure = 0;
-        s.rust_closure = 0;
-        s.thread = 0;
-        s.userdata = 0;
-        s.proto = 0;
-        s.short_string = 0;
-        cell.set(s);
-    });
+fn reset_gc_type_stats(g: &GlobalState<'_>) {
+    let mut s = g.gc_stats.get();
+    s.table = 0;
+    s.table_with_mt = 0;
+    s.lclosure = 0;
+    s.lclosure_with_upvals = 0;
+    s.cclosure = 0;
+    s.rust_closure = 0;
+    s.thread = 0;
+    s.userdata = 0;
+    s.proto = 0;
+    s.short_string = 0;
+    g.gc_stats.set(s);
 }
 
-fn dump_gc_stats(active_before: usize) {
+fn dump_gc_stats(g: &GlobalState<'_>, active_before: usize) {
     let reachable_count = {
         // reachable_total 由 collect_gc_inner 在调用前更新
-        GC_STATS.with(|c| c.get().reachable_total)
+        g.gc_stats.get().reachable_total
     };
     let active_count = active_before as u64;
-    gc_stats_inc(|s| {
+    gc_stats_inc(g, |s| {
         s.gc_cycles += 1;
         s.reachable_total = reachable_count;
         s.active_total = active_count;
     });
-    GC_STATS.with(|cell| {
-        let s = cell.get();
+    {
+        let s = g.gc_stats.get();
         let cyclic = s.table + s.lclosure + s.cclosure + s.rust_closure + s.thread + s.userdata;
         let non_cyclic = s.proto + s.short_string;
         let total = cyclic + non_cyclic;
@@ -313,14 +412,12 @@ fn dump_gc_stats(active_before: usize) {
             "[GC stats] cyclic_ratio={:.2}% (cyclic={} / total={})",
             pct, cyclic, total
         );
-        GC_TRIGGER_STATS.with(|cell| {
-            let t = cell.get();
-            eprintln!(
-                "[GC stats] triggers: maybe={} concat={} step={} explicit={}",
-                t.maybe, t.concat, t.step, t.explicit
-            );
-        });
-    });
+        let t = g.gc_trigger_stats.get();
+        eprintln!(
+            "[GC stats] triggers: maybe={} concat={} step={} explicit={}",
+            t.maybe, t.concat, t.step, t.explicit
+        );
+    }
 }
 
 // ============================================================================
@@ -328,15 +425,15 @@ fn dump_gc_stats(active_before: usize) {
 // ============================================================================
 
 #[derive(Default, Clone, Copy)]
-struct GcTriggerStats {
-    maybe: u64,
-    concat: u64,
-    step: u64,
-    explicit: u64,
+pub(crate) struct GcTriggerStats {
+    pub(crate) maybe: u64,
+    pub(crate) concat: u64,
+    pub(crate) step: u64,
+    pub(crate) explicit: u64,
 }
 
 impl GcTriggerStats {
-    const ZERO: Self = GcTriggerStats {
+    pub(crate) const ZERO: Self = GcTriggerStats {
         maybe: 0,
         concat: 0,
         step: 0,
@@ -352,28 +449,22 @@ pub(crate) enum GcTrigger {
     Explicit,
 }
 
-thread_local! {
-    static GC_TRIGGER_STATS: Cell<GcTriggerStats> = const { Cell::new(GcTriggerStats::ZERO) };
-}
-
-pub(crate) fn gc_trigger_inc(trigger: GcTrigger) {
+pub(crate) fn gc_trigger_inc(g: &GlobalState<'_>, trigger: GcTrigger) {
     if !gc_stats_enabled() {
         return;
     }
-    GC_TRIGGER_STATS.with(|cell| {
-        let mut s = cell.get();
-        match trigger {
-            GcTrigger::Maybe => s.maybe += 1,
-            GcTrigger::Concat => s.concat += 1,
-            GcTrigger::Step => s.step += 1,
-            GcTrigger::Explicit => s.explicit += 1,
-        }
-        cell.set(s);
-    });
+    let mut s = g.gc_trigger_stats.get();
+    match trigger {
+        GcTrigger::Maybe => s.maybe += 1,
+        GcTrigger::Concat => s.concat += 1,
+        GcTrigger::Step => s.step += 1,
+        GcTrigger::Explicit => s.explicit += 1,
+    }
+    g.gc_trigger_stats.set(s);
 }
 
-pub(crate) fn gc_trigger_explicit() {
-    gc_trigger_inc(GcTrigger::Explicit);
+pub(crate) fn gc_trigger_explicit(g: &GlobalState<'_>) {
+    gc_trigger_inc(g, GcTrigger::Explicit);
 }
 
 // ============================================================================
@@ -381,16 +472,16 @@ pub(crate) fn gc_trigger_explicit() {
 // ============================================================================
 
 #[derive(Default, Clone, Copy)]
-struct GcTimeStats {
-    total_us: u64,
-    count: u64,
-    max_us: u64,
-    str_sweep_us: u64,
-    str_for_each_us: u64,
+pub(crate) struct GcTimeStats {
+    pub(crate) total_us: u64,
+    pub(crate) count: u64,
+    pub(crate) max_us: u64,
+    pub(crate) str_sweep_us: u64,
+    pub(crate) str_for_each_us: u64,
 }
 
 impl GcTimeStats {
-    const ZERO: Self = GcTimeStats {
+    pub(crate) const ZERO: Self = GcTimeStats {
         total_us: 0,
         count: 0,
         max_us: 0,
@@ -399,30 +490,23 @@ impl GcTimeStats {
     };
 }
 
-thread_local! {
-    static GC_TIME_STATS: Cell<GcTimeStats> = const { Cell::new(GcTimeStats::ZERO) };
-    static STR_EXTRA_CACHE: Cell<(usize, usize, usize)> = const { Cell::new((0, 0, 0)) };
-}
-
-fn record_gc_time(elapsed: std::time::Duration) {
+fn record_gc_time(g: &GlobalState<'_>, elapsed: std::time::Duration) {
     let elapsed_us = elapsed.as_micros() as u64;
-    GC_TIME_STATS.with(|cell| {
-        let mut s = cell.get();
-        s.total_us += elapsed_us;
-        s.count += 1;
-        if elapsed_us > s.max_us {
-            s.max_us = elapsed_us;
-        }
-        cell.set(s);
-    });
+    let mut s = g.gc_time_stats.get();
+    s.total_us += elapsed_us;
+    s.count += 1;
+    if elapsed_us > s.max_us {
+        s.max_us = elapsed_us;
+    }
+    g.gc_time_stats.set(s);
 }
 
-pub fn print_gc_time_summary() {
+pub fn print_gc_time_summary(g: &GlobalState<'_>) {
     if !gc_stats_enabled() {
         return;
     }
-    GC_TIME_STATS.with(|cell| {
-        let s = cell.get();
+    {
+        let s = g.gc_time_stats.get();
         if s.count == 0 {
             return;
         }
@@ -441,7 +525,7 @@ pub fn print_gc_time_summary() {
                 .saturating_sub(s.str_for_each_us)) as f64
                 / 1_000_000.0,
         );
-    });
+    }
 }
 
 // ============================================================================
@@ -555,6 +639,11 @@ pub struct GCState<'a> {
     pub step_accum: Cell<usize>,
     /// GC 是否正在运行（collect_gc 进行中）— 用于阻止 finalizer 中重入
     pub gc_running: Cell<bool>,
+    /// 自身稳定地址（null = 未绑定；见 [`GCState::bind_owner_ptr`]）。
+    /// 新注册对象的 `gc_header.owner` 取此值，供引用计数死亡时找回本状态。
+    bound_owner: Cell<*const u8>,
+    /// objects 被借用期间挂起的死亡通知 id（本状态私有，替代原线程局部表）。
+    pending_deaths: RefCell<Vec<u32>>,
     /// 紧急回收模式 —— 对应 C 的 `global_State.gcemergency`（lgc.c::luaC_fullgc
     /// 的 `isemergency` 参数）：内存分配失败后的回收必须**避免改变解释器状态**，
     /// 即不运行 finalizer（可能执行任意 Lua 代码并再次分配）、不缩栈。
@@ -610,6 +699,8 @@ impl<'a> GCState<'a> {
             step_accum: Cell::new(0),
             gc_running: Cell::new(false),
             gcemergency: Cell::new(false),
+            bound_owner: Cell::new(std::ptr::null()),
+            pending_deaths: RefCell::new(Vec::new()),
             threads: RefCell::new(Vec::new()),
         }
     }
@@ -620,6 +711,66 @@ impl<'a> GCState<'a> {
         gc.set_gc_param(Self::PARAM_STEPMUL, 200);
         gc.set_gc_param(Self::PARAM_STEPSIZE, 100);
         gc
+    }
+
+    /// 绑定自身稳定地址 —— 必须在本状态获得**最终稳定地址**之后调用
+    ///（`Rc<RefCell<GlobalShared>>` 建立后）。绑定前注册的对象 owner 为空，
+    /// 死亡通知退化为 sweep 延迟释放（正确性不变，仅少优化）。
+    /// 幂等：重复调用为无操作（同一状态可能被多个执行态共享）。
+    pub fn bind_owner_ptr(&self) {
+        let me = self as *const _ as *const u8;
+        if self.bound_owner.get() == me {
+            return;
+        }
+        self.bound_owner.set(me);
+        // 补写绑定前已注册对象（通常为空）的 owner —— 使它们也能走早释放。
+        let objs = self.objects.borrow();
+        for meta in objs.metas.iter().flatten() {
+            unsafe {
+                with_header_of_weak(&meta.weak_value, |hdr| hdr.set_owner_ptr(me));
+            }
+        }
+    }
+
+    /// 清除一个已死对象的 meta（free_ids 复用 + 活跃计数 + 计费扣减）。
+    ///
+    /// 与 [`GCState::sweep_unreachable`] 的释放记账逐点一致：sweep 侧 subtract
+    /// `meta.size.max(32)`、push free_ids 带 try_reserve 守卫，此处同形。
+    fn early_unregister_locked(objs: &mut GcObjects<'_>, id32: u32, estimate: &Cell<usize>) {
+        let id = id32 as usize;
+        if id >= objs.metas.len() {
+            return;
+        }
+        if let Some(meta) = objs.metas[id].take() {
+            objs.active -= 1;
+            if objs.free_ids.len() + 1 <= objs.free_ids.capacity()
+                || objs.free_ids.try_reserve(1).is_ok()
+            {
+                objs.free_ids.push(id as u32);
+            }
+            let e = estimate.get();
+            estimate.set(e.saturating_sub(meta.size.max(32) as usize));
+        }
+    }
+
+    /// 排空本状态挂起的死亡通知 —— 在 objects RefCell 空闲的安全点调用
+    ///（collect 入口与 sweep 结束后）。
+    pub(crate) fn drain_pending_deaths(&self) {
+        if self.pending_deaths.borrow().is_empty() {
+            return;
+        }
+        let mut list = self.pending_deaths.borrow_mut();
+        let mut i = 0;
+        while i < list.len() {
+            let id32 = list[i];
+            match self.objects.try_borrow_mut() {
+                Ok(mut objs) => {
+                    Self::early_unregister_locked(&mut objs, id32, &self.gc_estimate);
+                    list.swap_remove(i);
+                }
+                Err(_) => i += 1,
+            }
+        }
     }
 
     /// GC 参数索引（与 C 的 LUA_GCP* 一致）
@@ -747,6 +898,12 @@ impl<'a> GCState<'a> {
             .try_register_object(t.mem_size(), WeakValue::Table(t.downgrade()))
             .map_err(|_| crate::mem::AllocFailed)?;
         t.data.borrow().gc_header.set_id(id);
+        t.data
+            .borrow()
+            .gc_header
+            .set_owner_ptr(self.bound_owner.get());
+        // 实测 RefCell<TableData> 的 value 偏移，供死亡通知的裸地址读取
+        crate::objects::measure_table_value_off(t.data.as_raw_ptr(), &t.data.borrow().gc_header);
         Ok(())
     }
 
@@ -760,6 +917,12 @@ impl<'a> GCState<'a> {
             .try_register_object(t.mem_size(), WeakValue::Table(t.downgrade()))
             .map_err(|_| crate::mem::AllocFailed)?;
         t.data.borrow().gc_header.set_id(id);
+        t.data
+            .borrow()
+            .gc_header
+            .set_owner_ptr(self.bound_owner.get());
+        // 实测 RefCell<TableData> 的 value 偏移，供死亡通知的裸地址读取
+        crate::objects::measure_table_value_off(t.data.as_raw_ptr(), &t.data.borrow().gc_header);
         Ok(())
     }
 
@@ -880,9 +1043,26 @@ impl<'a> GCState<'a> {
 
         // 遍历 metas 本身（下标即 ID，空闲槽位为 None）—— 不再维护/重写活跃表。
         // 0 号槽是 ID 起点占位，恒为 None。
+        //
+        // 存活对象统一重置为 otherwhite：对应 C 的 sweep 对**每个**存活对象
+        // `makewhite(g, o, otherwhite)`（周期收尾 enter_cycle 翻转 currentwhite
+        // 后它即成为当前白）。仅重置黑色不够 —— 周期中途创建、从未被 mark 的
+        // 对象可能落在上一相位的白上，下个周期会被误判存活，导致 `f = nil;
+        // collectgarbage()`（单周期）内 finalizer 不执行 → io 文件句柄不被
+        // __gc 关闭 → os.remove/os.rename 报「文件被占用」。
         for i in 1..objs.metas.len() {
-            let is_dead = match objs.metas[i].as_ref() {
-                Some(m) => m.color.is_white(cw),
+            let is_dead = match objs.metas[i].as_mut() {
+                Some(m) => {
+                    let dead = m.color.is_white(cw);
+                    if !dead {
+                        m.color = if cw & 1 != 0 {
+                            GCColor::White1
+                        } else {
+                            GCColor::White0
+                        };
+                    }
+                    dead
+                }
                 None => continue,
             };
 
@@ -1227,6 +1407,26 @@ impl<'a> GCState<'a> {
     }
 }
 
+impl Drop for GCState<'_> {
+    fn drop(&mut self) {
+        // 本状态即将消失：把仍存活对象的 owner 指针置空，使其日后的引用计数
+        // 死亡通知安全退化为无操作（而不是解引用已释放的 GCState）。
+        // 清空在 upgrade 出的临时 Rc 释放之前完成 —— 那些 Rc 若在此刻归零，
+        // notify 读到的 owner 已是空指针。
+        let me = self as *const _ as *const u8;
+        let objs = self.objects.get_mut();
+        for meta in objs.metas.iter().flatten() {
+            unsafe {
+                with_header_of_weak(&meta.weak_value, |hdr| {
+                    if hdr.owner_ptr() == me {
+                        hdr.set_owner_ptr(std::ptr::null());
+                    }
+                });
+            }
+        }
+    }
+}
+
 // ============================================================================
 // impl LuaState — GC 入口 / 标记 / 弱表 / finalizer
 // ============================================================================
@@ -1253,23 +1453,40 @@ impl<'a> LuaState<'a> {
     ///
     /// 对象创建路径必须用它（对应 C 的 `luaC_newobj` 不失败；Rust 侧对象表要增长，
     /// 故与其它分配点一样走「先 GC 再重试」漏斗，绝不 abort）。
+    ///
+    /// `header` 为对象自身的 GC 头：成功后写回 id 与死亡通知槽（owner）。
     pub fn register_object(
         &mut self,
+        header: &GCObjectHeader,
         size: usize,
         weak_value: crate::gc::WeakValue<'a>,
     ) -> Result<crate::gc::GCObjectId, VmError<'a>> {
-        match unsafe { self.gc_mut() }.try_register_object(size, weak_value) {
-            Ok(id) => Ok(id),
+        self.register_object_impl(header, size, weak_value)
+    }
+
+    fn register_object_impl(
+        &mut self,
+        header: &GCObjectHeader,
+        size: usize,
+        weak_value: crate::gc::WeakValue<'a>,
+    ) -> Result<crate::gc::GCObjectId, VmError<'a>> {
+        let id = match unsafe { self.gc_mut() }.try_register_object(size, weak_value) {
+            Ok(id) => id,
             Err(wv) => {
                 if self.can_retry_alloc() {
                     self.emergency_gc();
-                    if let Ok(id) = unsafe { self.gc_mut() }.try_register_object(size, wv) {
-                        return Ok(id);
+                    match unsafe { self.gc_mut() }.try_register_object(size, wv) {
+                        Ok(id) => id,
+                        Err(_) => return Err(VmError::MemoryError),
                     }
+                } else {
+                    return Err(VmError::MemoryError);
                 }
-                Err(VmError::MemoryError)
             }
-        }
+        };
+        header.set_id(id);
+        header.set_owner_ptr(unsafe { self.gc_mut() }.bound_owner.get());
+        Ok(id)
     }
 
     /// 登记表漏斗（见 [`LuaState::register_object`]）。
@@ -1376,7 +1593,7 @@ impl<'a> LuaState<'a> {
         }
         self.g_mut().last_gc_estimate = cur_estimate;
         if let Some(start) = gc_start {
-            record_gc_time(start.elapsed());
+            record_gc_time(self.g(), start.elapsed());
         }
         result
     }
@@ -1410,12 +1627,19 @@ impl<'a> LuaState<'a> {
 
     /// 阈值触发 GC（对应原 `maybe_collect_gc`）。
     pub fn maybe_collect_gc(&mut self) {
+        // finobj 扫描：finalizer 对象（__gc 表/udata）被 finobj_list 强引用，
+        // 引用计数永不归零，是唯一只能靠 sweep 回收的垃圾。引用计数架构下
+        // estimate 可能涨跌相抵而长期不超阈值，C 靠「垃圾不释放、内存单调增长」
+        // 保证 GC 必然发生 —— 这里改为：列表中出现 strong==1（仅剩 finobj_list
+        // 持有 = 已变垃圾）的对象时强制跑一次周期，分离并执行 finalizer。
+        // 列表通常为空，检查成本 ~2 次 borrow + len 判断。
+        let fin_due = self.g_mut().finobj_has_garbage();
         let (running, over) = unsafe {
             let g = self.gc_mut();
             (g.is_running(), g.total_estimate() > g.collect_threshold())
         };
-        if running && over {
-            gc_trigger_inc(GcTrigger::Maybe);
+        if running && (over || fin_due) {
+            gc_trigger_inc(self.g(), GcTrigger::Maybe);
             self.collect_gc();
         }
     }
@@ -1424,7 +1648,7 @@ impl<'a> LuaState<'a> {
     pub fn concat_gc_check(&mut self) {
         let cnt = self.concat_gc_counter.get() + 1;
         if cnt >= self.concat_gc_interval.get() {
-            gc_trigger_inc(GcTrigger::Concat);
+            gc_trigger_inc(self.g(), GcTrigger::Concat);
             self.collect_gc();
             self.concat_gc_counter.set(0);
         } else {
@@ -1435,7 +1659,7 @@ impl<'a> LuaState<'a> {
     /// 增量 step（对应原 `step_gc`）。
     pub fn step_gc(&mut self, siz: usize) -> bool {
         if siz == 0 {
-            gc_trigger_inc(GcTrigger::Step);
+            gc_trigger_inc(self.g(), GcTrigger::Step);
             self.collect_gc();
             unsafe { self.gc_mut().step_accum.set(0) };
             true
@@ -1443,7 +1667,7 @@ impl<'a> LuaState<'a> {
             let acc = unsafe { self.gc_mut().step_accum.get() } + siz;
             let threshold = unsafe { self.gc_mut().active_count().max(1) };
             if acc >= threshold {
-                gc_trigger_inc(GcTrigger::Step);
+                gc_trigger_inc(self.g(), GcTrigger::Step);
                 self.collect_gc();
                 unsafe { self.gc_mut().step_accum.set(0) };
                 true
@@ -1457,8 +1681,10 @@ impl<'a> LuaState<'a> {
     /// 完整 GC 实现 —— 标记、ephemeron 收敛、finalizer、弱表清理、sweep。
     fn collect_gc_inner(&mut self, worklist: &mut Vec<RawTValue<'a>>) {
         let active = unsafe { self.gc_mut().active_count() };
+        // 排空上一周期 sweep 期间挂起的死亡通知（meta 尚存的已死对象）
+        unsafe { self.gc_mut().drain_pending_deaths() };
         if gc_stats_enabled() {
-            reset_gc_type_stats();
+            reset_gc_type_stats(self.g());
         }
 
         // 进入新周期：翻转 white、清空所有队列（含 aux_marked）
@@ -1488,6 +1714,8 @@ impl<'a> LuaState<'a> {
             }
         }
         {
+            // io_input_handle/io_output_handle 对应 C 的 io.input/io.output 存入
+            // registry（LUA_REGISTRYINDEX 的 IO_INPUT/IO_OUTPUT key）—— 是 GC 根。
             let file_handles = self.file_handles.borrow();
             match self.io_input_handle.get() {
                 Some(handle) => {
@@ -1582,6 +1810,8 @@ impl<'a> LuaState<'a> {
 
         // 清扫（无参，读颜色）
         unsafe { self.gc_mut().sweep_unreachable() };
+        // sweep 借用期间挂起的死亡通知（clear_for_drop 连锁 drop 触发）就地排空
+        unsafe { self.gc_mut().drain_pending_deaths() };
 
         // 字符串表清理
         let str_sweep_start = if gc_stats_enabled() {
@@ -1592,11 +1822,9 @@ impl<'a> LuaState<'a> {
         self.string_table.sweep();
         if let Some(start) = str_sweep_start {
             let elapsed = start.elapsed().as_micros() as u64;
-            GC_TIME_STATS.with(|cell| {
-                let mut s = cell.get();
-                s.str_sweep_us += elapsed;
-                cell.set(s);
-            });
+            let mut s = self.g().gc_time_stats.get();
+            s.str_sweep_us += elapsed;
+            self.g().gc_time_stats.set(s);
         }
 
         // 计费：短串遍历
@@ -1607,7 +1835,7 @@ impl<'a> LuaState<'a> {
         };
         let nuse = self.string_table.count();
         let table_ptr = &self.string_table as *const _ as usize;
-        let cached = STR_EXTRA_CACHE.with(|c| c.get());
+        let cached = self.g().str_extra_cache.get();
         let short_string_count: u64;
         if cached.0 == table_ptr && cached.1 == nuse {
             extra_size += cached.2;
@@ -1621,18 +1849,16 @@ impl<'a> LuaState<'a> {
                 count += 1;
             });
             extra_size += str_extra;
-            STR_EXTRA_CACHE.with(|c| c.set((table_ptr, nuse, str_extra)));
+            self.g().str_extra_cache.set((table_ptr, nuse, str_extra));
             short_string_count = count;
         }
         if let Some(start) = str_for_each_start {
             let elapsed = start.elapsed().as_micros() as u64;
-            GC_TIME_STATS.with(|cell| {
-                let mut s = cell.get();
-                s.str_for_each_us += elapsed;
-                cell.set(s);
-            });
+            let mut s = self.g().gc_time_stats.get();
+            s.str_for_each_us += elapsed;
+            self.g().gc_time_stats.set(s);
         }
-        gc_stats_inc(|s| {
+        gc_stats_inc(self.g(), |s| {
             s.short_string += short_string_count;
         });
 
@@ -1665,12 +1891,10 @@ impl<'a> LuaState<'a> {
 
         if gc_stats_enabled() {
             // 更新 reachable_total（用 active_after 近似可达数）
-            GC_STATS.with(|cell| {
-                let mut s = cell.get();
-                s.reachable_total = active_after as u64;
-                cell.set(s);
-            });
-            dump_gc_stats(active);
+            let mut s = self.g().gc_stats.get();
+            s.reachable_total = active_after as u64;
+            self.g().gc_stats.set(s);
+            dump_gc_stats(self.g(), active);
         }
     }
 
@@ -1914,7 +2138,7 @@ impl<'a> LuaState<'a> {
                     None => (false, false),
                 };
                 let has_mt = data.metatable.is_some();
-                gc_stats_inc(|s| {
+                gc_stats_inc(self.g(), |s| {
                     s.table += 1;
                     if has_mt {
                         s.table_with_mt += 1;
@@ -1951,7 +2175,7 @@ impl<'a> LuaState<'a> {
                 *extra_size += c.proto.gc_mem_size();
                 let upvals = c.upvals.borrow();
                 let upvals_len = upvals.len();
-                gc_stats_inc(|s| {
+                gc_stats_inc(self.g(), |s| {
                     s.lclosure += 1;
                     s.proto += 1;
                     if upvals_len > 0 {
@@ -1979,7 +2203,7 @@ impl<'a> LuaState<'a> {
                     return;
                 }
                 *extra_size += cc.gc_mem_size();
-                gc_stats_inc(|s| {
+                gc_stats_inc(self.g(), |s| {
                     s.cclosure += 1;
                 });
                 let upvalue = cc.upvalue.borrow();
@@ -1993,7 +2217,7 @@ impl<'a> LuaState<'a> {
                     return;
                 }
                 *extra_size += rc.gc_mem_size();
-                gc_stats_inc(|s| {
+                gc_stats_inc(self.g(), |s| {
                     s.rust_closure += 1;
                 });
                 let upvals = rc.upvalues.borrow();
@@ -2009,7 +2233,7 @@ impl<'a> LuaState<'a> {
                 if let Some(id) = u.gc_header.id() {
                     gc.set_color(id, GCColor::Gray);
                 }
-                gc_stats_inc(|s| {
+                gc_stats_inc(self.g(), |s| {
                     s.userdata += 1;
                 });
                 if let Some(ref mt) = &*u.metatable.borrow() {
@@ -2027,7 +2251,7 @@ impl<'a> LuaState<'a> {
                     return;
                 }
                 *extra_size += t.gc_mem_size();
-                gc_stats_inc(|s| {
+                gc_stats_inc(self.g(), |s| {
                     s.thread += 1;
                 });
                 self.collect_thread_roots(t, worklist);
@@ -2138,7 +2362,11 @@ impl<'a> LuaState<'a> {
                 .gc_header
                 .id()
                 .map_or(false, |id| !gc.is_white(id));
-            if is_reachable {
+            // 垃圾判定：引用计数架构下颜色不可靠（上周期标黑的遗留、meta 被
+            // sweep 清掉后误判可达），strong==1（drain 转移所有权后仅 `t` 持有 =
+            // 原本仅 finobj_list 持有）才是可靠信号 —— 程序中已无任何其它引用。
+            let only_list = t.data.strong_count() == 1;
+            if is_reachable && !only_list {
                 keep.push(t);
                 continue;
             }
@@ -2158,6 +2386,14 @@ impl<'a> LuaState<'a> {
                     drop(tv);
                     keep.push(t);
                 } else {
+                    // 置位 finalized：finalizer 中被 remark 的对象（重新注册回
+                    // finobj_list）不再触发 finobj 扫描，避免「每周期重复回收
+                    // remark 垃圾」造成 VM 爬行（C 中它也须再经完整标记周期）
+                    if let Some(id) = t.data.borrow().gc_header.id() {
+                        if let Some(mut m) = gc.meta_mut(id) {
+                            m.finalized = true;
+                        }
+                    }
                     to_finalize.push(TValue::Table(t.clone()));
                     let tv = TValue::Table(t);
                     unsafe { worklist.push(raw_from_tvalue(&tv)) };
@@ -2165,12 +2401,16 @@ impl<'a> LuaState<'a> {
                 }
             }
         }
+        let (nt, nu) = self.finobj_counts.get();
+        self.finobj_counts.set((keep.len(), nu));
         *self.finobj_list.borrow_mut() = keep;
 
         let mut ud_keep: Vec<MyRc<crate::objects::Udata, SlotAlloc>> = Vec::new();
         for u in self.ud_finobj_list.borrow_mut().drain(..) {
             let is_reachable = u.gc_header.id().map_or(false, |id| !gc.is_white(id));
-            if is_reachable {
+            // 同 Table 版：strong==1（drain 转移所有权后仅 `u` 持有）= 已变垃圾
+            let only_list = u.strong_count() == 1;
+            if is_reachable && !only_list {
                 ud_keep.push(u);
                 continue;
             }
@@ -2188,6 +2428,12 @@ impl<'a> LuaState<'a> {
                     drop(tv);
                     ud_keep.push(u);
                 } else {
+                    // 同 Table 版：置位 finalized 防止 remark 垃圾反复触发扫描
+                    if let Some(id) = u.gc_header.id() {
+                        if let Some(mut m) = gc.meta_mut(id) {
+                            m.finalized = true;
+                        }
+                    }
                     to_finalize.push(TValue::UserData(u.clone()));
                     let tv = TValue::UserData(u);
                     unsafe { worklist.push(raw_from_tvalue(&tv)) };
@@ -2195,6 +2441,8 @@ impl<'a> LuaState<'a> {
                 }
             }
         }
+        let (nt, nu) = self.finobj_counts.get();
+        self.finobj_counts.set((nt, ud_keep.len()));
         *self.ud_finobj_list.borrow_mut() = ud_keep;
 
         while let Some(raw) = worklist.pop() {
@@ -2374,6 +2622,8 @@ impl<'a> GlobalState<'a> {
             .any(|x| std::ptr::addr_eq(x.data.as_raw_ptr(), addr));
         if !already {
             self.finobj_list.borrow_mut().push(t.clone());
+            let (nt, nu) = self.finobj_counts.get();
+            self.finobj_counts.set((nt + 1, nu));
         }
     }
 
@@ -2390,7 +2640,58 @@ impl<'a> GlobalState<'a> {
             .any(|x| std::ptr::addr_eq(x.as_raw_ptr(), addr));
         if !already {
             self.ud_finobj_list.borrow_mut().push(u.clone());
+            let (nt, nu) = self.finobj_counts.get();
+            self.finobj_counts.set((nt, nu + 1));
         }
+    }
+
+    /// 检查 finobj 列表中是否存在「垃圾」—— 仅剩 finobj_list 一个强引用的对象。
+    ///
+    /// 引用计数架构下，被本列表持有的对象 strong 永不归零、不会像普通死对象那样
+    /// 被早释放，是唯一只能靠 GC sweep 回收的垃圾。若程序中其它引用已全部消失
+    /// （strong==1 = 仅列表持有），必须跑一次周期来分离并执行 finalizer —— 否则
+    /// estimate 涨跌相抵时（对象创建/死亡相抵）阈值永不触发，finalizer 无限延迟
+    /// （对应 C 靠「垃圾不释放、内存单调增长」保证 GC 必然发生的机制）。
+    ///
+    /// **忽略已执行过 finalizer 的对象**（`meta.finalized`）：finalizer 中 remark
+    /// 自己的对象（如 tests_lua/tracegc.lua 的 `setmetatable(o, mt)`）会重新注册
+    /// 回 finobj_list 且永为 strong==1，若不过滤将导致每次 maybe_collect_gc 都
+    /// 触发完整周期、VM 爬行。C 中这类对象也要等完整标记周期才会再次进 tobefnz，
+    /// 不会随 luaC_checkGC 每次都回收。
+    /// 快路径：两个列表都空（finobj_counts == 0）时一次 Cell 读返回。
+    pub(crate) fn finobj_has_garbage(&self) -> bool {
+        let (nt, nu) = self.finobj_counts.get();
+        if (nt, nu) == (0, 0) {
+            return false;
+        }
+        let gc: &GCState<'a> = unsafe { &*self.gc.as_ptr() };
+        {
+            let list = self.finobj_list.borrow();
+            if !list.is_empty()
+                && list.iter().any(|t| {
+                    if t.data.strong_count() != 1 {
+                        return false;
+                    }
+                    let id = t.data.borrow().gc_header.id();
+                    id.and_then(|id| gc.meta(id))
+                        .map(|m| !m.finalized)
+                        .unwrap_or(true)
+                })
+            {
+                return true;
+            }
+        }
+        let list = self.ud_finobj_list.borrow();
+        !list.is_empty()
+            && list.iter().any(|u| {
+                if u.strong_count() != 1 {
+                    return false;
+                }
+                let id = u.gc_header.id();
+                id.and_then(|id| gc.meta(id))
+                    .map(|m| !m.finalized)
+                    .unwrap_or(true)
+            })
     }
 
     /// 清理弱引用表 —— 基于颜色/aux_marked 判断键/值是否死亡。

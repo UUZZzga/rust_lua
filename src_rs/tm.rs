@@ -686,35 +686,33 @@ pub(crate) fn call_tm<'a>(
 // ```
 //
 // 找不到 __close 元方法时返回 Ok(false)，调用成功返回 Ok(true)，调用错误返回 Err。
-thread_local! {
-    static CLOSE_METHOD_DEPTH: std::cell::Cell<usize> = std::cell::Cell::new(0);
-}
-
 pub fn call_close_method<'a>(
     state: &mut LuaState<'a>,
     obj: &TValue<'a>,
     err: Option<&TValue<'a>>,
     yy: bool,
 ) -> Result<bool, VmError<'a>> {
-    let depth = CLOSE_METHOD_DEPTH.with(|d| {
-        let v = d.get();
-        d.set(v + 1);
-        v
-    });
+    let depth = state.g_mut().close_depth;
     // 对应 C 的 luaE_checkcstack: __close 链式调用达到 LUAI_MAXCCALLS 时
     // 抛出可被 pcall 捕获的 "C stack overflow" 错误（cstack.lua:108 期望此消息）。
     // 不能 panic，否则 coroutine.close 无法返回 (false, msg)。
     if depth >= crate::state::LUAI_MAXCCALLS as usize {
-        CLOSE_METHOD_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
         return Err(VmError::RuntimeError("C stack overflow".to_string()));
     }
-    struct DepthGuard;
-    impl Drop for DepthGuard {
-        fn drop(&mut self) {
-            CLOSE_METHOD_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-        }
-    }
-    let _guard = DepthGuard;
+    // 深度归属全局状态（见 GlobalState::close_depth）：进入 +1、返回复原。
+    // 包装而非守卫 RAII，是为了让内层所有 `?` 提前返回都自动复原。
+    state.g_mut().close_depth = depth + 1;
+    let r = call_close_method_inner(state, obj, err, yy);
+    state.g_mut().close_depth = depth;
+    r
+}
+
+fn call_close_method_inner<'a>(
+    state: &mut LuaState<'a>,
+    obj: &TValue<'a>,
+    err: Option<&TValue<'a>>,
+    yy: bool,
+) -> Result<bool, VmError<'a>> {
     // 查找 __close 元方法
     // 对应 C 的 callclosemethod: 不检查 __close 是否存在，直接把 tm 放到栈上调用。
     // 如果 tm 是 nil（__close 被移除），luaD_callnoyield 尝试调用 nil，

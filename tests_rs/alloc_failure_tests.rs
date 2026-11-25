@@ -156,10 +156,14 @@ fn transient_alloc_failure_triggers_emergency_gc_and_retry() {
     let mut buff = BufferIo::new("");
     let mut h = harness(&mut buff);
 
-    // 1) 准备垃圾：停止 GC（对应 `collectgarbage("stop")`），制造 20k 个不可达表
+    // 1) 准备垃圾：停止 GC（对应 `collectgarbage("stop")`），制造 20k 对**互相引用的
+    //    表环**。注意不能用单向持有的孤立表：早释放机制（strong 归零即提前注销 GC
+    //    登记并归还内存）会让 `hold = nil` 的连锁 drop 把垃圾提前释放掉，紧急回收
+    //    便无垃圾可收 —— 测试前提失效。表环的强引用互持不归零，只能靠 sweep 回收，
+    //    恰好保留「紧急 GC 必须回收不可达垃圾」的原意。
     assert_eq!(h.run_ok("collectgarbage('stop')"), 0, "gc_stop 应成功");
     assert_eq!(
-        h.run_ok("hold = {} for i = 1, 20000 do hold[i] = { i } end hold = nil"),
+        h.run_ok("for i = 1, 20000 do local a = {} local b = {} a[1] = b b[1] = a end"),
         0
     );
     let before = h.gc_count();
@@ -321,6 +325,11 @@ fn emergency_gc_defers_finalizers_without_losing_them() {
     let mut buff = BufferIo::new("");
     let mut h = harness(&mut buff);
 
+    // 停止自动 GC：本用例要观察的是「**紧急**回收不运行 finalizer」，前提是
+    // emergency 之前 finalizer 没有被**自动**周期提前执行。finobj 扫描
+    // （fin_due）会在任意分配点触发自动周期，故用 gc_stop 冻结自动 GC；
+    // 显式 collect 与 emergency 回收都不受 gc_stop 影响。
+    assert_eq!(h.run_ok("collectgarbage('stop')"), 0);
     assert_eq!(
         h.run_ok(
             "gc_ran = 0; \

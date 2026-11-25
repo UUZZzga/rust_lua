@@ -7093,6 +7093,8 @@ impl VmExecutor {
                 // 提前提取 proto 和闭包引用，使后续可以 move closure（而非 clone）
                 // perf: 消除 CallInfoEntry.closure 的 Box 堆分配
                 let proto = Rc::clone(&closure.proto);
+                // 注意：此处保持 clone 而非 move —— A/B 实测 clone 版基准快 ~0.35s
+                // （clone+drop 对可被 LLVM 消除；move 会延长栈槽生命周期妨碍其它优化）
                 let callee_closure = closure.clone();
 
                 // perf: caller_proto 延迟计算 (同 fast path), 从 state.stack[entry.func] 获取
