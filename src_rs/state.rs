@@ -3424,14 +3424,23 @@ impl<'a> CallInfoEntry<'a> {
                     _ => None,
                 }),
             Self::Full(f) => {
+                // 显式 closure 优先：pcall 分支（state.pcall 的 Lua 分支）以
+                // `is_c = !caller_is_lua` + `Some(closure)` 记录「C 调用者 → 被调
+                // Lua 函数」，C API 调用 main chunk 时就是这种形态 —— 错误快照
+                // 要靠它拿回 main chunk 闭包（debug.getinfo(4) 的行号来源，
+                // tests_lua/main.lua 的 __tostring 用例）。
+                // 只有「无显式 closure 的 C 条目」才禁止回退 stack[f.func]：
+                // 其 func 槽恰好是被调函数移入的槽（luaB_pcall 语义），会把被调
+                // 闭包误当成条目闭包，导致 already_has_entry 误判跳过 push。
+                if let Some(c) = f.closure.as_ref() {
+                    return Some(c);
+                }
                 if f.is_c {
                     return None;
                 }
-                f.closure.as_ref().or_else(|| {
-                    stack.get(f.func).and_then(|v| match v {
-                        TValue::LClosure(c) => Some(c),
-                        _ => None,
-                    })
+                stack.get(f.func).and_then(|v| match v {
+                    TValue::LClosure(c) => Some(c),
+                    _ => None,
                 })
             }
         }
