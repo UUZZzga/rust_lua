@@ -87,7 +87,11 @@ local function GC1 ()
   local finish = false
   u = setmetatable({}, {__gc = function () finish = true end})
   b = {34}
-  repeat u = {} until finish
+  -- 【RS 架构注记】Rc 实现下，普通死对象（strong 归零）无论 GC 是否运行都会被
+  -- 引用计数立即释放（早释放机制同步削减 estimate），净分配 ≈ 0 → maybe_collect_gc
+  -- 阈值永不触发 → finalizer 无从执行。改用**自引用环**（强引用互持永不归零，
+  -- 只能靠 sweep 回收）制造净增长，保留 "创建对象激活 GC、最终执行 __gc" 的原意。
+  repeat u = {}; u[1] = u until finish
   assert(b[1] == 34)   -- 'u' was collected, but 'b' was not
 
   finish = false; local i = 1
@@ -97,7 +101,11 @@ local function GC1 ()
 
   finish = false
   u = setmetatable({}, {__gc = function () finish = true end})
-  repeat local i; u = function () return i end until finish
+  -- 闭包同理：用捕获自身的环（upvalue 'f' 引用闭包自身，死亡时 strong 不归零，
+  -- 只能靠 sweep 回收）保持净分配为正；同时每轮覆盖 u，保留 "finalizer 对象
+  -- 变不可达后由 GC 执行 __gc" 的原语义。
+  local f
+  repeat f = function () return f end; u = f until finish
   assert(b[1] == 34)   -- 'u' was collected, but 'b' was not
 end
 
@@ -106,7 +114,7 @@ local function GC2 ()
   local finish = false
   u = {setmetatable({}, {__gc = function () finish = true end})}
   local b = {34}
-  repeat u = {{}} until finish
+  repeat u = {{}}; u[1][1] = u[1] until finish
   assert(b[1] == 34)   -- 'u' was collected, but 'b' was not
 
   finish = false; local i = 1
@@ -116,7 +124,8 @@ local function GC2 ()
 
   finish = false
   u = {setmetatable({}, {__gc = function () finish = true end})}
-  repeat local i; u = {function () return i end} until finish
+  local f
+  repeat f = function () return f end; u = {f} until finish
   assert(b[1] == 34)   -- 'u' was collected, but 'b' was not
 end
 
@@ -203,16 +212,22 @@ end
 
 if not _port then
   -- test the pace of the collector
+  -- 【RS 架构注记】引用计数实现下，普通死对象（strong 归零）无论 GC 是否 stop 都会被
+  -- 立即释放（早释放机制还会同步削减 estimate），"stop 后内存涨 3 倍" 的原前提不成立。
+  -- 改用**自引用环**制造 sweep-only 垃圾：环的强引用互持永不归零，早释放不触发，
+  -- 只能靠 GC sweep 回收 —— 完整保留两段原意：
+  --   stop 段：环垃圾不被回收 → 内存单调涨到 3x 才退出（GC 确实停了）；
+  --   restart 段：环垃圾被增量回收 → 内存回落到 2x 以内才退出（GC 确实恢复了）。
   collectgarbage(); collectgarbage()
   local x = gcinfo()
   collectgarbage"stop"
   repeat
-    local a = {}
+    local a = {}; a[1] = a
   until gcinfo() > 3 * x
   collectgarbage"restart"
   assert(collectgarbage("isrunning"))
   repeat
-    local a = {}
+    local a = {}; a[1] = a
   until gcinfo() <= x * 2
 end
 
@@ -551,8 +566,11 @@ do
   collectgarbage"stop"
   collectgarbage("step")   -- steps should not unblock the collector
   local x = gcinfo()
+  -- 【RS 架构注记】同 pace 测试：Rc 实现下覆盖全局变量会立即释放旧值（stop 不生效于
+  -- 引用计数死亡），内存几乎不涨。改用自引用环制造 sweep-only 垃圾，stop 下只能
+  -- 靠 sweep 回收 —— 内存单调上涨，保留 "stop 期间无回收" 的原意。
   repeat
-    for i=1,1000 do _ENV.a = {} end   -- no collection during the loop
+    for i=1,1000 do _ENV.a = {} _ENV.a[1] = _ENV.a end   -- no collection during the loop
   until gcinfo() > 2 * x
   collectgarbage"restart"
   _ENV.a = nil

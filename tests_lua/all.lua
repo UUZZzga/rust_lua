@@ -155,7 +155,13 @@ local dofile = function (n, strip)
   return f()
 end
 
-dofile('main.lua')
+-- main.lua 测试 stand-alone 解释器，依赖 Unix shell（env/kill/sleep/重定向）；
+-- Windows 下跳过，Linux（CI）必须运行 —— 它是退出码与命令行参数解析的门禁。
+if package.config:sub(1, 1) == "/" then
+  dofile('main.lua')
+else
+  print("skipping main.lua (requires Unix-like shell)")
+end
 
 -- trace GC cycles
 require"tracegc".start()
@@ -286,4 +292,3 @@ if not usertests then
 end
 
 print("final OK !!!")
-

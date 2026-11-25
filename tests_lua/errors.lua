@@ -421,7 +421,7 @@ end
 local function lineerror (s, l, w)
   local err,msg = pcall(load(s))
   local line = tonumber(string.match(msg, ":(%d+):"))
-  assert((line == l or (not line and not l)) and string.find(msg, w))
+  assert((line == l or (not line and not l)) and string.find(msg, w), string.format("for %s | %s | %s", l, w, msg))
 end
 
 lineerror("local a\n for i=1,'a' do \n print(i) \n end", 2, "limit")
@@ -600,7 +600,7 @@ if not _soft then
   f(3)
 
   local function loop (x,y,z) return 1 + loop(x, y, z) end
- 
+
   local res, msg = xpcall(loop, function (m)
     assert(string.find(m, "stack overflow"))
     checkerr("error handling", loop)
@@ -654,7 +654,7 @@ do
   -- 'assert' with extra arguments
   res, msg = pcall(assert, false, "X", t)
   assert(not res and msg == "X")
- 
+
   -- 'assert' with no message
   res, msg = pcall(function () assert(false) end)
   local line = string.match(msg, "%w+%.lua:(%d+): assertion failed!$")

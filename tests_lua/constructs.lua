@@ -80,16 +80,16 @@ do   -- testing operators with different kinds of constants
         _ENV.XX = o1
         local code = string.format("return XX %s %s", op, o2)
         local res = assert(load(code))()
-        assert(res == gab)
+        assert(res == gab, string.format("for %s %s %s", o1, op, o2))
 
         _ENV.XX = o2
         code = string.format("return (%s) %s XX", o1, op)
         res = assert(load(code))()
-        assert(res == gab)
+        assert(res == gab, string.format("for %s %s %s", o1, op, o2))
 
         code = string.format("return (%s) %s %s", o1, op, o2)
         res = assert(load(code))()
-        assert(res == gab)
+        assert(res == gab, string.format("for %s %s %s", o1, op, o2))
       end
     end
   end
