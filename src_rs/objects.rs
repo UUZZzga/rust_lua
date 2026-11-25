@@ -28,7 +28,7 @@ use std::hash::{Hash, Hasher};
 use crate::alloc::simple_arc_clone;
 use crate::alloc::{myrc_clone, simple_rc_clone, SimpleRc};
 use crate::config::{LuaInteger, LuaNumber, LuaUnsigned};
-use crate::mem::{AllocFailed, SlotAlloc};
+use crate::mem::SlotAlloc;
 use crate::strings::{
     lua_string_as_str, lua_string_eq, lua_string_hash, ArcRc, LongString, ShortString,
 };
@@ -1473,16 +1473,21 @@ impl<'a> CClosure<'a> {
 /// Given: 上值已关闭，持有值 TValue::Integer(42)
 /// When: 读取上值
 /// Then: 返回 TValue::Integer(42)
+/// 上值链表「空指针」哨兵 — perf: `Option<usize>`(16B) → `u32`(4B)。
+/// 栈索引上限 LUAI_MAXSTACK(1M)+EXTRA_STACK、链表槽位数均远小于 u32::MAX。
+/// UpVal::Open 三字段全 u32 后 payload 13B，枚举整体 16B（此前 48B）。
+pub const NO_UPVAL: u32 = u32::MAX;
+
 #[derive(Debug, Clone)]
 pub enum UpVal<'a> {
     /// 打开的上值（指向栈上的活跃变量）
     Open {
         /// 栈上位置索引
-        stack_index: usize,
-        /// 链表中的下一个上值索引
-        next: Option<usize>,
-        /// 链表中的上一个上值索引
-        previous: Option<usize>,
+        stack_index: u32,
+        /// 链表中的下一个上值槽位索引（NO_UPVAL = 无）
+        next: u32,
+        /// 链表中的上一个上值槽位索引（NO_UPVAL = 无）
+        previous: u32,
         /// 是否为 to-be-closed 上值（对应 C 的 uv->tbc）
         /// close 时若为 true，需调用 __close 元方法
         tbc: bool,
@@ -1501,7 +1506,7 @@ impl<'a> UpVal<'a> {
 
     pub fn level(&self) -> Option<usize> {
         match self {
-            UpVal::Open { stack_index, .. } => Some(*stack_index),
+            UpVal::Open { stack_index, .. } => Some(*stack_index as usize),
             UpVal::Closed { .. } => None,
         }
     }
@@ -1519,7 +1524,10 @@ impl<'a> UpVal<'a> {
 pub struct UpValVec<'a> {
     len: u8,
     inline: [std::mem::MaybeUninit<UpValRef<'a>>; 4],
-    heap: Option<Vec<UpValRef<'a>>>,
+    /// perf: 替代 `Option<Vec<UpValRef>>`(24B) — 堆缓冲指针（null = 内联存储）。
+    /// 已初始化元素数恒等于 `len`（迁移/扩容均由本类型手动管理），容量见 `heap_cap`。
+    heap_ptr: *mut UpValRef<'a>,
+    heap_cap: u32,
 }
 
 impl<'a> Clone for UpValVec<'a> {
@@ -1537,7 +1545,8 @@ impl<'a> UpValVec<'a> {
         UpValVec {
             len: 0,
             inline: std::array::from_fn(|_| std::mem::MaybeUninit::uninit()),
-            heap: None,
+            heap_ptr: std::ptr::null_mut(),
+            heap_cap: 0,
         }
     }
 
@@ -1545,21 +1554,52 @@ impl<'a> UpValVec<'a> {
         if capacity <= 4 {
             UpValVec::new()
         } else {
-            UpValVec {
-                len: 0,
-                inline: std::array::from_fn(|_| std::mem::MaybeUninit::uninit()),
-                heap: Some(Vec::with_capacity(capacity)),
+            let mut v = UpValVec::new();
+            v.grow_heap(capacity);
+            v
+        }
+    }
+
+    /// 分配容量为 `cap` 的堆缓冲（保留既有内容）。
+    ///
+    /// SAFETY（调用方约定）: `cap > 4`；扩容路径要求调用前 `heap_ptr` 非空
+    /// 或 `len == 0`（本类型只在迁移/`with_capacity` 时调用，满足约定）。
+    fn grow_heap(&mut self, cap: usize) {
+        debug_assert!(cap > 4 && cap <= u32::MAX as usize);
+        let layout =
+            std::alloc::Layout::array::<UpValRef<'a>>(cap).expect("UpValVec heap layout overflow");
+        let new_ptr = unsafe { std::alloc::alloc(layout) } as *mut UpValRef<'a>;
+        if new_ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        if self.len > 0 {
+            // SAFETY: 0..len 已初始化（内联或旧堆缓冲），新缓冲容量 ≥ len
+            unsafe {
+                let src = if self.heap_ptr.is_null() {
+                    self.inline.as_ptr() as *const UpValRef<'a>
+                } else {
+                    self.heap_ptr
+                };
+                std::ptr::copy_nonoverlapping(src, new_ptr, self.len as usize);
             }
         }
+        if !self.heap_ptr.is_null() {
+            // SAFETY: 旧缓冲由 grow_heap/From 以同 layout 分配
+            unsafe {
+                std::alloc::dealloc(
+                    self.heap_ptr as *mut u8,
+                    std::alloc::Layout::array::<UpValRef<'a>>(self.heap_cap as usize).unwrap(),
+                );
+            }
+        }
+        self.heap_ptr = new_ptr;
+        self.heap_cap = cap as u32;
     }
 
     /// 堆缓冲区容量（内联存储时为 0）。
     /// （GC 内存计费用，见 `LClosure::gc_mem_size`；内联部分已计入 LClosure 自身大小。）
     pub fn heap_capacity(&self) -> usize {
-        match &self.heap {
-            Some(h) => h.capacity(),
-            None => 0,
-        }
+        self.heap_cap as usize
     }
 
     pub fn push_val(
@@ -1572,53 +1612,58 @@ impl<'a> UpValVec<'a> {
     }
 
     pub fn push_ref(&mut self, val: UpValRef<'a>) {
-        if self.heap.is_none() && self.len as usize >= 4 {
+        if self.heap_ptr.is_null() && self.len as usize >= 4 {
             // 内联已满: 迁移到堆
-            let mut v = Vec::with_capacity(8);
-            for i in 0..self.len as usize {
-                // SAFETY: 迁移只发生一次, i < len 的元素均已初始化
-                v.push(unsafe { self.inline[i].assume_init_read() });
-            }
-            v.push(val);
-            self.heap = Some(v);
+            self.grow_heap(8);
+            // SAFETY: 迁移后 len-1 位置的旧槽不再使用（len 计入堆侧）
             self.len += 1;
+            unsafe {
+                std::ptr::write(self.heap_ptr.add(self.len as usize - 1), val);
+            }
             return;
         }
-        match &mut self.heap {
-            Some(h) => {
-                h.push(val);
+        if !self.heap_ptr.is_null() {
+            if self.len as usize >= self.heap_cap as usize {
+                self.grow_heap(self.heap_cap as usize * 2);
             }
-            None => {
-                // SAFETY: len < 4, 槽位未初始化, ptr::write 语义
-                self.inline[self.len as usize].write(val);
+            // SAFETY: 扩容后 len < cap
+            unsafe {
+                std::ptr::write(self.heap_ptr.add(self.len as usize), val);
             }
+        } else {
+            // SAFETY: len < 4, 槽位未初始化, ptr::write 语义
+            self.inline[self.len as usize].write(val);
         }
         self.len += 1;
     }
 
     fn as_slice(&self) -> &[UpValRef<'a>] {
-        match &self.heap {
-            Some(h) => &h[..self.len as usize],
+        if !self.heap_ptr.is_null() {
+            // SAFETY: 0..len 的堆槽位均已初始化
+            unsafe { std::slice::from_raw_parts(self.heap_ptr, self.len as usize) }
+        } else {
             // SAFETY: 0..len 的槽位均已初始化
-            None => unsafe {
+            unsafe {
                 std::slice::from_raw_parts(
                     self.inline.as_ptr() as *const UpValRef,
                     self.len as usize,
                 )
-            },
+            }
         }
     }
 
     fn as_mut_slice(&mut self) -> &mut [UpValRef<'a>] {
-        match &mut self.heap {
-            Some(h) => &mut h[..self.len as usize],
+        if !self.heap_ptr.is_null() {
+            // SAFETY: 0..len 的堆槽位均已初始化
+            unsafe { std::slice::from_raw_parts_mut(self.heap_ptr, self.len as usize) }
+        } else {
             // SAFETY: 0..len 的槽位均已初始化
-            None => unsafe {
+            unsafe {
                 std::slice::from_raw_parts_mut(
                     self.inline.as_mut_ptr() as *mut UpValRef,
                     self.len as usize,
                 )
-            },
+            }
         }
     }
 }
@@ -1638,10 +1683,15 @@ impl<'a> From<Vec<UpValRef<'a>>> for UpValVec<'a> {
             }
             u
         } else {
+            let len = v.len();
+            let cap = v.capacity();
+            let ptr = v.as_ptr() as *mut UpValRef<'a>;
+            std::mem::forget(v);
             UpValVec {
-                len: v.len() as u8,
+                len: len as u8,
                 inline: std::array::from_fn(|_| std::mem::MaybeUninit::uninit()),
-                heap: Some(v),
+                heap_ptr: ptr,
+                heap_cap: cap as u32,
             }
         }
     }
@@ -1662,13 +1712,25 @@ impl<'a> std::ops::DerefMut for UpValVec<'a> {
 
 impl<'a> Drop for UpValVec<'a> {
     fn drop(&mut self) {
-        if self.heap.is_none() {
+        if self.heap_ptr.is_null() {
             // inline 部分：MaybeUninit 不自动 drop，需手动
             for i in 0..self.len as usize {
                 // SAFETY: 0..len 的槽位由 push 初始化
                 unsafe {
                     self.inline[i].assume_init_drop();
                 }
+            }
+        } else {
+            // SAFETY: 0..len 的堆槽位由 push/迁移初始化
+            unsafe {
+                std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
+                    self.heap_ptr,
+                    self.len as usize,
+                ));
+                std::alloc::dealloc(
+                    self.heap_ptr as *mut u8,
+                    std::alloc::Layout::array::<UpValRef<'a>>(self.heap_cap as usize).unwrap(),
+                );
             }
         }
     }
@@ -2081,10 +2143,6 @@ unsafe impl<'a> crate::alloc::RcPayload for Udata<'a> {
 /// 此时「当前帧的函数槽」按定义 = `state.base - 1`（见 `LuaState::cur_func`）。
 #[derive(Debug, Clone)]
 pub struct CallFrame<'a> {
-    pub code: Rc<Vec<Instruction>>,
-    pub constants: Rc<Vec<TValue<'a>>>,
-    /// 子原型列表 — Rc 共享，op_call 保存调用现场时 O(1) 引用计数（perf: 消除 Vec 分配）
-    pub protos: Rc<Vec<Rc<Proto<'a>>>>,
     /// 被调帧函数槽（C 的 `ci->func.p`；VARARGPREP 会调整）
     pub func: usize,
     /// 调用者基址（返回时写回 `state.base`）—— 不是本帧的 `func + 1`
@@ -2895,8 +2953,8 @@ mod tests {
     fn test_upval_open() {
         let uv = UpVal::Open {
             stack_index: 3,
-            next: None,
-            previous: None,
+            next: NO_UPVAL,
+            previous: NO_UPVAL,
             tbc: false,
         };
         match uv {
@@ -2909,8 +2967,8 @@ mod tests {
     fn test_upval_open_is_open() {
         let uv = UpVal::Open {
             stack_index: 3,
-            next: None,
-            previous: None,
+            next: NO_UPVAL,
+            previous: NO_UPVAL,
             tbc: false,
         };
         assert!(uv.is_open());

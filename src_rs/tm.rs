@@ -12,7 +12,7 @@
 //! - 错误处理使用 `Result<(), VmError>` 替代 C 的 longjmp
 
 use std::fmt;
-use std::rc::Rc;
+// use std::rc::Rc; — removed: saved_code 三件套删除后不再直接用 Rc
 
 use bitflags::bitflags;
 
@@ -417,9 +417,6 @@ pub(crate) fn call_tm_res<'a>(
     // name = 事件名 (如 "index", "add"), namewhat = "metamethod"
     let caller_base = state.base;
     let caller_pc = state.pc;
-    let caller_code = state.code.clone();
-    let caller_constants = state.constants.clone();
-    let caller_protos = state.protos.clone();
     let caller_num_params = state.num_params;
     let caller_is_vararg = state.is_vararg;
     let caller_proto_flag = state.proto_flag;
@@ -448,9 +445,6 @@ pub(crate) fn call_tm_res<'a>(
     state
         .pcall_protection_stack
         .push(crate::state::PcallProtection {
-            saved_code: caller_code.clone(),
-            saved_constants: caller_constants.clone(),
-            saved_protos: caller_protos.clone(),
             saved_base: caller_base,
             saved_pc: caller_pc,
             saved_mret_end: state.mret_end,
@@ -584,9 +578,6 @@ pub(crate) fn call_tm<'a>(
 
     let caller_base = state.base;
     let caller_pc = state.pc;
-    let caller_code = state.code.clone();
-    let caller_constants = state.constants.clone();
-    let caller_protos = state.protos.clone();
     let caller_num_params = state.num_params;
     let caller_is_vararg = state.is_vararg;
     let caller_proto_flag = state.proto_flag;
@@ -614,9 +605,6 @@ pub(crate) fn call_tm<'a>(
     state
         .pcall_protection_stack
         .push(crate::state::PcallProtection {
-            saved_code: caller_code.clone(),
-            saved_constants: caller_constants.clone(),
-            saved_protos: caller_protos.clone(),
             saved_base: caller_base,
             saved_pc: caller_pc,
             saved_mret_end: state.mret_end,
@@ -787,9 +775,6 @@ pub fn call_close_method<'a>(
     state
         .pcall_protection_stack
         .push(crate::state::PcallProtection {
-            saved_code: Rc::new(Vec::new()),
-            saved_constants: Rc::new(Vec::new()),
-            saved_protos: Rc::new(Vec::new()),
             saved_base: 0,
             saved_pc: 0,
             // C 的 `ci->u2.nres`: __close 从 OP_RETURN/OP_CLOSE 被调起, 被中断帧的

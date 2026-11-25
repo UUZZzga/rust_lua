@@ -1711,8 +1711,8 @@ impl<'a> LuaState<'a> {
                     }
                 }
                 UpVal::Open { stack_index, .. } => {
-                    if *stack_index < self.top {
-                        let val = &self.stack[*stack_index];
+                    if (*stack_index as usize) < self.top {
+                        let val = &self.stack[*stack_index as usize];
                         if needs_gc_mark(val) {
                             unsafe { worklist.push(raw_from_tvalue(val)) };
                         }
@@ -1722,9 +1722,12 @@ impl<'a> LuaState<'a> {
         }
 
         for frame in &self.call_stack {
-            for val in &frame.constants[..] {
-                if needs_gc_mark(val) {
-                    unsafe { worklist.push(raw_from_tvalue(val)) };
+            // constants 视图派生自 caller_closure.proto（帧不再持有 code/constants/protos Rc）
+            if let Some(caller) = &frame.caller_closure {
+                for val in caller.proto.constants.iter() {
+                    if needs_gc_mark(val) {
+                        unsafe { worklist.push(raw_from_tvalue(val)) };
+                    }
                 }
             }
             if let Some(caller) = &frame.caller_closure {
@@ -1788,7 +1791,7 @@ impl<'a> LuaState<'a> {
                 unsafe { worklist.push(raw_from_tvalue(val)) };
             }
         }
-        for val in &exec.constants[..] {
+        for val in exec.cur_proto().constants.iter() {
             if needs_gc_mark(val) {
                 unsafe { worklist.push(raw_from_tvalue(val)) };
             }
@@ -1809,8 +1812,8 @@ impl<'a> LuaState<'a> {
                     }
                 }
                 UpVal::Open { stack_index, .. } => {
-                    if *stack_index < exec.top {
-                        let val = &exec.stack[*stack_index];
+                    if (*stack_index as usize) < exec.top {
+                        let val = &exec.stack[*stack_index as usize];
                         if needs_gc_mark(val) {
                             unsafe { worklist.push(raw_from_tvalue(val)) };
                         }
@@ -1819,9 +1822,11 @@ impl<'a> LuaState<'a> {
             }
         }
         for frame in &exec.call_stack {
-            for val in &frame.constants[..] {
-                if needs_gc_mark(val) {
-                    unsafe { worklist.push(raw_from_tvalue(val)) };
+            if let Some(caller) = &frame.caller_closure {
+                for val in caller.proto.constants.iter() {
+                    if needs_gc_mark(val) {
+                        unsafe { worklist.push(raw_from_tvalue(val)) };
+                    }
                 }
             }
             if let Some(caller) = &frame.caller_closure {
@@ -1958,8 +1963,8 @@ impl<'a> LuaState<'a> {
                             self.push_mark(gc, value, worklist);
                         }
                         UpVal::Open { stack_index, .. } => {
-                            if *stack_index < self.top {
-                                let val = &self.stack[*stack_index];
+                            if (*stack_index as usize) < self.top {
+                                let val = &self.stack[*stack_index as usize];
                                 self.push_mark(gc, val, worklist);
                             }
                         }

@@ -475,9 +475,6 @@ pub(crate) fn call_pcall<'a>(
     state
         .pcall_protection_stack
         .push(crate::state::PcallProtection {
-            saved_code: state.code.clone(),
-            saved_constants: state.constants.clone(),
-            saved_protos: state.protos.clone(),
             saved_base: state.base,
             saved_mret_end: state.mret_end,
             saved_pc: state.pc,
@@ -1226,9 +1223,6 @@ fn call_pairs<'a>(
         state
             .pcall_protection_stack
             .push(crate::state::PcallProtection {
-                saved_code: state.code.clone(),
-                saved_constants: state.constants.clone(),
-                saved_protos: state.protos.clone(),
                 saved_base: state.base,
                 saved_mret_end: state.mret_end,
                 saved_pc: state.pc + 1, // 跳过调用 pairs 的 CALL 指令
@@ -1329,9 +1323,6 @@ pub(crate) fn call_xpcall<'a>(
     state
         .pcall_protection_stack
         .push(crate::state::PcallProtection {
-            saved_code: state.code.clone(),
-            saved_constants: state.constants.clone(),
-            saved_protos: state.protos.clone(),
             saved_base: state.base,
             saved_mret_end: state.mret_end,
             saved_pc: state.pc,

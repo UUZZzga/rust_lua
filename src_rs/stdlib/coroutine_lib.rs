@@ -16,7 +16,7 @@ use crate::alloc::SimpleRc;
 use crate::execute::{VmError, VmExecutor, VmResult};
 use crate::objects::{
     BuiltinFn, LClosure, LuaThread, NilKind, TValue, Table, ThreadContext, ThreadStatus, UpVal,
-    UpValRef,
+    UpValRef, NO_UPVAL,
 };
 use crate::state::LuaState;
 use crate::strings::lua_string_as_str;
@@ -345,7 +345,7 @@ fn collect_and_close_upvals_impl<'a>(
             let uv = uv_ref.borrow();
             match &*uv {
                 UpVal::Open { stack_index, .. } => {
-                    let original_idx = *stack_index;
+                    let original_idx = *stack_index as usize;
                     let val = state
                         .stack
                         .get(original_idx)
@@ -542,7 +542,7 @@ fn collect_open_upvals_recursive_impl<'a>(
             let uv = uv_ref.borrow();
             match &*uv {
                 UpVal::Open { stack_index, .. } => {
-                    let original_idx = *stack_index;
+                    let original_idx = *stack_index as usize;
                     let val = state
                         .stack
                         .get(original_idx)
@@ -667,9 +667,9 @@ fn sync_upvals_back<'a>(
                 let mut uv = info.uv_ref.borrow_mut();
                 if let UpVal::Closed { .. } = &*uv {
                     *uv = UpVal::Open {
-                        stack_index: info.original_stack_index,
-                        next: None,
-                        previous: None,
+                        stack_index: info.original_stack_index as u32,
+                        next: NO_UPVAL,
+                        previous: NO_UPVAL,
                         tbc: false,
                     };
                     true
@@ -697,7 +697,7 @@ fn close_yield_upvals<'a>(
     let has_container = yield_values
         .iter()
         .any(|v| matches!(v, TValue::LClosure(_) | TValue::Table(_)));
-    if !has_container && state.open_upval.is_none() {
+    if !has_container && state.open_upval == NO_UPVAL {
         return Vec::new();
     }
     let mut result_info: Vec<OpenUpvalInfo> = Vec::new();
@@ -739,8 +739,9 @@ fn close_yield_upvals<'a>(
     // 先收集要关闭的 uv_idx（遍历链表时不能修改链表），再逐个 unlink + close
     let mut to_close: Vec<(usize, usize)> = Vec::new(); // (uv_idx, stack_index)
     let mut current = state.open_upval;
-    while let Some(uv_idx) = current {
-        let uv_ref = match crate::func::upval_slot(state, uv_idx) {
+    while current != NO_UPVAL {
+        let uv_idx = current;
+        let uv_ref = match crate::func::upval_slot(state, uv_idx as usize) {
             Some(r) => r.clone(),
             None => break,
         };
@@ -753,13 +754,13 @@ fn close_yield_upvals<'a>(
                     tbc,
                     ..
                 } => (*stack_index, *next, true, *tbc),
-                UpVal::Closed { .. } => (0, None, false, false),
+                UpVal::Closed { .. } => (0, NO_UPVAL, false, false),
             }
         };
         if is_open && !is_tbc {
             let ptr = SimpleRc::as_ptr(&uv_ref) as usize;
             if visited.insert(ptr) {
-                to_close.push((uv_idx, stack_index));
+                to_close.push((uv_idx as usize, stack_index as usize));
             }
         }
         current = next;
@@ -801,13 +802,14 @@ fn relink_upval<'a>(state: &mut LuaState<'a>, uv_idx: usize) {
             _ => return,
         }
     };
-    let mut prev: Option<usize> = None;
+    let mut prev: u32 = NO_UPVAL;
     let mut current = state.open_upval;
-    while let Some(idx) = current {
-        if idx == uv_idx {
+    while current != NO_UPVAL {
+        let idx = current;
+        if idx as usize == uv_idx {
             return; // 已在链表中
         }
-        let (cur_level, next) = match crate::func::upval_slot(state, idx) {
+        let (cur_level, next) = match crate::func::upval_slot(state, idx as usize) {
             Some(slot) => match &*slot.borrow() {
                 UpVal::Open {
                     stack_index, next, ..
@@ -819,7 +821,7 @@ fn relink_upval<'a>(state: &mut LuaState<'a>, uv_idx: usize) {
         if cur_level < stack_index {
             break;
         }
-        prev = Some(idx);
+        prev = idx;
         current = next;
     }
     let next_node = current;
@@ -838,24 +840,21 @@ fn relink_upval<'a>(state: &mut LuaState<'a>, uv_idx: usize) {
             *next = next_node;
         }
     }
-    match prev {
-        Some(p_idx) => {
-            let slot = crate::func::upval_slot(state, p_idx).expect("prev 槽位必须存活");
-            if let UpVal::Open { ref mut next, .. } = &mut *slot.borrow_mut() {
-                *next = Some(uv_idx);
-            }
+    if prev != NO_UPVAL {
+        let slot = crate::func::upval_slot(state, prev as usize).expect("prev 槽位必须存活");
+        if let UpVal::Open { ref mut next, .. } = &mut *slot.borrow_mut() {
+            *next = uv_idx as u32;
         }
-        None => {
-            state.open_upval = Some(uv_idx);
-        }
+    } else {
+        state.open_upval = uv_idx as u32;
     }
-    if let Some(n_idx) = next_node {
-        let slot = crate::func::upval_slot(state, n_idx).expect("next 槽位必须存活");
+    if next_node != NO_UPVAL {
+        let slot = crate::func::upval_slot(state, next_node as usize).expect("next 槽位必须存活");
         if let UpVal::Open {
             ref mut previous, ..
         } = &mut *slot.borrow_mut()
         {
-            *previous = Some(uv_idx);
+            *previous = uv_idx as u32;
         }
     }
 }
@@ -872,14 +871,14 @@ fn sync_yield_upvals_back<'a>(state: &mut LuaState<'a>, origins: &[(UpValRef<'a>
             }
         };
         // 写回协程栈
-        if *stack_index < state.top {
-            state.stack[*stack_index] = val;
+        if (*stack_index as usize) < state.top {
+            state.stack[*stack_index as usize] = val;
         }
         // 恢复为 Open（指向协程栈）
         *uv_ref.borrow_mut() = UpVal::Open {
-            stack_index: *stack_index,
-            next: None,
-            previous: None,
+            stack_index: *stack_index as u32,
+            next: NO_UPVAL,
+            previous: NO_UPVAL,
             tbc: false,
         };
         // 重新加入 open_upval 链表（槽位若已被回收则重新登记）
@@ -1581,17 +1580,14 @@ fn setup_first_resume<'a>(
     let nargs = resume_args.len();
 
     if let TValue::LClosure(closure) = &func {
-        // Lua 函数: 从 proto 加载执行上下文 — Rc::clone O(1) 替代 Vec 深拷贝
-        co.code = Rc::clone(&closure.proto.code);
-        co.constants = Rc::clone(&closure.proto.constants);
-        co.protos = closure.proto.protos.clone();
+        // Lua 函数: 执行上下文派生自 closure.proto（cur_proto），无需单独加载
         co.pc = 0;
         co.num_params = closure.proto.num_params;
         co.is_vararg = closure.proto.is_vararg();
         co.proto_flag = closure.proto.flag;
         co.nextraargs = 0;
         co.closure = Some(closure.clone());
-        co.open_upval = None;
+        co.open_upval = NO_UPVAL;
         co.tbc_list = None;
         // 入口帧（协程体）没有 ci 记录：其身份由 co.base 决定
         // （「当前帧函数槽」见 `LuaState::cur_func`）。
@@ -1657,16 +1653,17 @@ fn setup_first_resume<'a>(
         use crate::opcodes::{create_abck, OpCode};
         let call_inst = create_abck(OpCode::CALL, 0, (nargs + 1) as i32, 0, 0);
         let return_inst = create_abck(OpCode::RETURN, 0, 0, 0, 0);
-        co.code = Rc::new(vec![call_inst, return_inst]);
-        co.constants = Rc::new(Vec::new());
-        co.protos = Rc::new(Vec::new());
+        // 伪帧: closure 为 None，合成 proto 作为 fallback（cur_proto 回退目标）
+        let mut fake_proto = crate::func::new_proto();
+        fake_proto.code = Rc::new(vec![call_inst, return_inst]);
+        co.fallback_proto = Rc::new(fake_proto);
         co.pc = 0;
         co.num_params = nargs as u8;
         co.is_vararg = false;
         co.proto_flag = 0;
         co.nextraargs = 0;
         co.closure = None;
-        co.open_upval = None;
+        co.open_upval = NO_UPVAL;
         co.tbc_list = None;
         co.call_stack = Vec::new();
         co.call_info = Vec::new();
@@ -2482,11 +2479,9 @@ pub fn c_api_reset_thread<'a>(state: &mut LuaState<'a>) -> i32 {
     state.pcall_protection_stack.clear();
     state.open_upvals.clear();
     state.free_upvals.clear();
-    state.open_upval = None;
+    state.open_upval = NO_UPVAL;
     state.tbc_list = None;
-    state.constants = std::rc::Rc::new(Vec::new());
-    state.code = std::rc::Rc::new(Vec::new());
-    state.protos = std::rc::Rc::new(Vec::new());
+    state.fallback_proto = std::rc::Rc::new(crate::func::new_proto());
     status
 }
 

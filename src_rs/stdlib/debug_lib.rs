@@ -2208,8 +2208,8 @@ fn call_getupvalue<'a>(
                 let val = match &*uv_ref {
                     UpVal::Closed { value } => value.clone(),
                     UpVal::Open { stack_index, .. } => {
-                        if *stack_index < state.top {
-                            state.stack[*stack_index].clone()
+                        if (*stack_index as usize) < state.top {
+                            state.stack[*stack_index as usize].clone()
                         } else {
                             TValue::Nil(NilKind::Strict)
                         }
@@ -2331,7 +2331,7 @@ fn call_setupvalue<'a>(
                                         *val = value.clone();
                                         None
                                     }
-                                    UpVal::Open { stack_index, .. } => Some(*stack_index),
+                                    UpVal::Open { stack_index, .. } => Some(*stack_index as usize),
                                 }
                             };
                             if let Some(idx) = action {

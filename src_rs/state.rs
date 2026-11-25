@@ -7,8 +7,7 @@ use crate::helper::JmpBuf;
 use crate::mem::SlotAlloc;
 use crate::mem::{AllocOwner, Allocator, DefaultAllocator, MemState};
 use crate::objects::{
-    Instruction, LClosure, LuaThread, LuaType, NilKind, Proto, TValue, ThreadContext, UpVal,
-    UpValRef, UpValVec,
+    LClosure, LuaThread, LuaType, NilKind, Proto, TValue, ThreadContext, UpVal, UpValRef, UpValVec,
 };
 use crate::strings::{lua_string_as_str, lua_string_len, StringTable, MEMERRMSG};
 use crate::table::Table;
@@ -78,11 +77,8 @@ pub enum PcallKind<'a> {
 /// （对应 C Lua 的 precover + finishpcallk 机制）。
 #[derive(Clone, Debug)]
 pub struct PcallProtection<'a> {
-    /// pcall 调用者的执行上下文（saved_*）— 用于恢复 pcall 调用者的执行
-    pub saved_code: Rc<Vec<Instruction>>,
-    pub saved_constants: Rc<Vec<TValue<'a>>>,
-    /// 调用者的子原型列表 — Rc 共享，yield 穿越 pcall 时 O(1) 引用计数
-    pub saved_protos: Rc<Vec<Rc<Proto<'a>>>>,
+    /// pcall 调用者的执行上下文（saved_*）— code/constants/protos 派生自
+    /// `saved_closure.proto`，不再单独保存。
     pub saved_base: usize,
     pub saved_pc: usize,
     /// 被中断帧的「多返回值产出末尾」(C 的 `L->top` / `ci->u2.nres`)。close / 元方法 /
@@ -173,11 +169,10 @@ impl<'a> GlobalShared<'a> {
 
 #[derive(Debug)]
 pub struct LuaState<'a> {
-    // Rc<Vec> 避免 op_call 中深拷贝 proto 字段（perf: 省 ~5.3% malloc+memmove）
-    pub constants: Rc<Vec<TValue<'a>>>,
-    pub code: Rc<Vec<Instruction>>,
-    /// 当前执行函数的子原型列表 — Rc 共享，op_call 切换 proto 时 O(1) 引用计数
-    pub protos: Rc<Vec<Rc<Proto<'a>>>>,
+    /// closure 为 None 时的回退 proto（协程伪帧 / 初始态 / C 上下文）。
+    /// 当前执行视图（code/constants/protos）一律经 [`LuaState::cur_proto`] 派生自
+    /// `closure.proto`（perf: 帧 push/pop 免 6 次 Rc 引用计数）。
+    pub fallback_proto: Rc<Proto<'a>>,
     pub top: usize,
     /// 最近一次「多返回值产出」的末尾位置 (对应 C 的 `L->top` 在 OP_CALL b==0
     /// 语义下携带的信息: "else previous instruction set top")。
@@ -215,7 +210,8 @@ pub struct LuaState<'a> {
     pub open_upvals: Vec<Option<UpValRef<'a>>>,
     /// `open_upvals` 的空闲槽位索引（后进先出复用以保持局部性）。
     pub free_upvals: Vec<usize>,
-    pub open_upval: Option<usize>,
+    /// open upvalue 链表头（槽位索引，NO_UPVAL = 空链表）— 不随函数调用/返回保存/恢复
+    pub open_upval: u32,
     pub tbc_list: Option<usize>,
     pub call_stack: Vec<crate::objects::CallFrame<'a>>,
     pub stack: Vec<TValue<'a>>,
@@ -396,13 +392,22 @@ pub struct LuaState<'a> {
 pub const DROP_QUEUE_LIMIT: usize = 256;
 
 impl<'a> LuaState<'a> {
+    /// 当前执行函数的 proto —— 派生自 `closure.proto`；closure 为 None（协程伪帧 /
+    /// 初始态 / C 上下文）时回退 `fallback_proto`。对应 C 的 `clLvalue(ci->func.p)->p`。
+    /// perf: 替代原独立字段 code/constants/protos —— 帧切换免 3 次 Rc clone + 3 次 drop。
+    #[inline]
+    pub fn cur_proto(&self) -> &Rc<Proto<'a>> {
+        match &self.closure {
+            Some(cl) => &cl.proto,
+            None => &self.fallback_proto,
+        }
+    }
+
     /// 协程/新线程的执行态骨架（对应 C 中为新线程分配的 `lua_State`）：
     /// 独立字段全默认，不持有共享块；`l_g` 由调用方 `bind_g` 绑定。
     pub fn empty_thread() -> Self {
         LuaState {
-            constants: Rc::new(Vec::new()),
-            code: Rc::new(Vec::new()),
-            protos: Rc::new(Vec::new()),
+            fallback_proto: Rc::new(crate::func::new_proto()),
             top: 0,
             mret_end: 0,
             lua_frame_ceiling: 0,
@@ -415,7 +420,7 @@ impl<'a> LuaState<'a> {
             closure: None,
             open_upvals: Vec::new(),
             free_upvals: Vec::new(),
-            open_upval: None,
+            open_upval: crate::objects::NO_UPVAL,
             tbc_list: None,
             call_stack: Vec::new(),
             stack: Vec::new(),
@@ -1632,9 +1637,6 @@ impl<'a> LuaState<'a> {
                 let proto = Rc::clone(&closure.proto);
                 let callee_closure = closure.clone();
 
-                let saved_code = std::mem::take(&mut self.code);
-                let saved_constants = std::mem::take(&mut self.constants);
-                let saved_protos = std::mem::take(&mut self.protos);
                 let saved_base = self.base;
                 let saved_pc = self.pc;
                 let saved_num_params = self.num_params;
@@ -1697,9 +1699,6 @@ impl<'a> LuaState<'a> {
                     drop(closure);
                 }
 
-                self.code = Rc::clone(&proto.code);
-                self.constants = Rc::clone(&proto.constants);
-                self.protos = proto.protos.clone();
                 self.base = func_idx + 1;
                 self.pad_frame_scratch();
                 self.pc = 0;
@@ -1750,9 +1749,6 @@ impl<'a> LuaState<'a> {
                 if need_shield {
                     self.pcall_protection_stack
                         .push(crate::state::PcallProtection {
-                            saved_code: Rc::new(Vec::new()),
-                            saved_constants: Rc::new(Vec::new()),
-                            saved_protos: Rc::new(Vec::new()),
                             saved_base: 0,
                             saved_pc: 0,
                             saved_mret_end: 0,
@@ -1949,9 +1945,6 @@ impl<'a> LuaState<'a> {
                         });
                     if let Some(idx) = target_idx {
                         let top = &mut self.pcall_protection_stack[idx];
-                        top.saved_code = saved_code.clone();
-                        top.saved_constants = saved_constants.clone();
-                        top.saved_protos = saved_protos.clone();
                         top.saved_base = saved_base;
                         // is_metamethod: saved_pc 不 +1，保留指向被中断的指令（OP_LE/OP_MMBIN），
                         // 以便 op_return continuation 时读取该指令并完成（对应 C 的 luaV_finishOp）。
@@ -2070,9 +2063,6 @@ impl<'a> LuaState<'a> {
                         .find(|&i| !self.pcall_protection_stack[i].saved_filled);
                     if let Some(idx) = target_idx {
                         let top = &mut self.pcall_protection_stack[idx];
-                        top.saved_code = saved_code.clone();
-                        top.saved_constants = saved_constants.clone();
-                        top.saved_protos = saved_protos.clone();
                         top.saved_base = saved_base;
                         top.saved_pc = saved_pc + 1;
                         top.saved_num_params = saved_num_params;
@@ -2092,9 +2082,6 @@ impl<'a> LuaState<'a> {
                 // is_close_yield: __close 正在执行，state 是 __close 的状态
                 // is_yield: foo 直接 yield，state 是 foo 的状态
                 if !is_yield && !is_close_yield {
-                    self.code = saved_code;
-                    self.constants = saved_constants;
-                    self.protos = saved_protos;
                     self.base = saved_base;
                     self.pc = saved_pc;
                     self.num_params = saved_num_params;
@@ -2483,9 +2470,6 @@ impl<'a> LuaState<'a> {
                 });
                 if let Some(idx) = target_idx {
                     let top = &mut self.pcall_protection_stack[idx];
-                    top.saved_code = self.code.clone();
-                    top.saved_constants = self.constants.clone();
-                    top.saved_protos = self.protos.clone();
                     top.saved_base = self.base;
                     // is_close_continuation: saved_pc 不 +1，保留指向 OP_RETURN/OP_CLOSE
                     top.saved_pc = self.pc;
@@ -3469,9 +3453,7 @@ impl<'a> LuaState<'a> {
             io: crate::mock::io_mock::lua_io(),
         });
         let mut s = LuaState::empty_thread();
-        s.constants = proto.constants.clone();
-        s.code = proto.code.clone();
-        s.protos = proto.protos.clone();
+        s.fallback_proto = Rc::new(proto.clone());
         s.stack = stack;
         s.top = top;
         s.base = base;

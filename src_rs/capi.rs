@@ -4510,8 +4510,8 @@ pub extern "C-unwind" fn lua_getupvalue(
                     match &*uv {
                         UpVal::Closed { value } => value.clone(),
                         UpVal::Open { stack_index, .. } => {
-                            if *stack_index < L.top {
-                                L.stack[*stack_index].clone()
+                            if (*stack_index as usize) < L.top {
+                                L.stack[*stack_index as usize].clone()
                             } else {
                                 TValue::Nil(NilKind::Strict)
                             }
@@ -4603,7 +4603,7 @@ pub extern "C-unwind" fn lua_setupvalue(
                         *val = value.clone();
                         None
                     }
-                    UpVal::Open { stack_index, .. } => Some(*stack_index),
+                    UpVal::Open { stack_index, .. } => Some(*stack_index as usize),
                 }
             };
             if let Some(idx) = action {
