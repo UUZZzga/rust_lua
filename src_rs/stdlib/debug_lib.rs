@@ -243,7 +243,7 @@ fn get_frame_info<'a>(state: &LuaState<'a>, level: i32) -> Option<FrameInfo<'a>>
     // level >= 2: 从 call_info 获取调用者信息
     // 当最后一个 call_info 条目是 C 函数时，它代表当前正在执行的 C 函数（level 0），
     // 需要跳过它来计算 level >= 2 的索引。
-    let c_func_offset = if state.call_info.last().map(|e| e.is_c).unwrap_or(false) {
+    let c_func_offset = if state.call_info.last().map(|e| e.is_c()).unwrap_or(false) {
         1
     } else {
         0
@@ -253,7 +253,7 @@ fn get_frame_info<'a>(state: &LuaState<'a>, level: i32) -> Option<FrameInfo<'a>>
         .len()
         .checked_sub((level as usize).saturating_sub(1) + c_func_offset)?;
     let entry = &state.call_info[idx];
-    if entry.base == 0 || entry.base > state.top {
+    if entry.base(&state.call_stack) == 0 || entry.base(&state.call_stack) > state.top {
         return None;
     }
     // 计算 limit: 对应 C 的 ci->next->func.p
@@ -263,15 +263,15 @@ fn get_frame_info<'a>(state: &LuaState<'a>, level: i32) -> Option<FrameInfo<'a>>
     } else {
         // 被调用者是 level-1, 其 call_info 条目在 idx+1
         let callee_entry = &state.call_info[idx + 1];
-        callee_entry.func
+        callee_entry.func(&state.call_stack)
     };
-    if let TValue::LClosure(closure) = &state.stack[entry.func] {
+    if let TValue::LClosure(closure) = &state.stack[entry.func(&state.call_stack)] {
         return Some(FrameInfo {
-            base: entry.base,
-            func: entry.func,
-            pc: entry.saved_pc,
-            proto_flag: entry.proto_flag,
-            nextraargs: entry.nextraargs,
+            base: entry.base(&state.call_stack),
+            func: entry.func(&state.call_stack),
+            pc: entry.saved_pc(&state.call_stack),
+            proto_flag: entry.proto_flag(&state.call_stack),
+            nextraargs: entry.nextraargs(&state.call_stack),
             closure: Some(closure.clone()),
             limit,
             is_c: false,
@@ -279,11 +279,11 @@ fn get_frame_info<'a>(state: &LuaState<'a>, level: i32) -> Option<FrameInfo<'a>>
     }
     // C 函数帧 — 对应 C 的 CIST_C
     Some(FrameInfo {
-        base: entry.base,
-        func: entry.func,
-        pc: entry.saved_pc,
-        proto_flag: entry.proto_flag,
-        nextraargs: entry.nextraargs,
+        base: entry.base(&state.call_stack),
+        func: entry.func(&state.call_stack),
+        pc: entry.saved_pc(&state.call_stack),
+        proto_flag: entry.proto_flag(&state.call_stack),
+        nextraargs: entry.nextraargs(&state.call_stack),
         closure: None,
         limit,
         is_c: true,
@@ -949,7 +949,7 @@ fn fill_info_from_level<'a>(
             // 从 call_info 获取 name 和 namewhat
             // call_info[last] 记录了当前函数是如何被调用的
             // 当最后一个条目是 C 函数时，跳过它（C 函数条目记录的是 C 函数的调用信息）
-            let name_idx = if state.call_info.last().map(|e| e.is_c).unwrap_or(false)
+            let name_idx = if state.call_info.last().map(|e| e.is_c()).unwrap_or(false)
                 && state.call_info.len() >= 2
             {
                 state.call_info.len() - 2
@@ -960,7 +960,8 @@ fn fill_info_from_level<'a>(
                 .call_info
                 .get(name_idx)
                 .map(|entry| {
-                    let (_, _, n, nw) = crate::execute::compute_caller_info(&state.stack, entry);
+                    let (_, _, n, nw) =
+                        crate::execute::compute_caller_info(&state.stack, &state.call_stack, entry);
                     (if n.is_empty() { None } else { Some(n) }, nw)
                 })
                 .unwrap_or((None, String::new()));
@@ -1003,7 +1004,7 @@ fn fill_info_from_level<'a>(
                 // 从 call_info 读取 is_tailcall — 对应 C 的 ci->callstatus & CIST_TAIL
                 // call_info[last] 是 debug.getinfo 自身（C 函数），需要跳过它
                 // 获取调用 debug.getinfo 的函数（level 1）的 CallInfoEntry
-                let tail_idx = if state.call_info.last().map(|e| e.is_c).unwrap_or(false)
+                let tail_idx = if state.call_info.last().map(|e| e.is_c()).unwrap_or(false)
                     && state.call_info.len() >= 2
                 {
                     state.call_info.len() - 2
@@ -1013,7 +1014,7 @@ fn fill_info_from_level<'a>(
                 let istailcall = state
                     .call_info
                     .get(tail_idx)
-                    .map(|e| e.is_tailcall)
+                    .map(|e| e.is_tailcall())
                     .unwrap_or(false);
                 info.istailcall = istailcall;
                 info.extraargs = state.nextraargs;
@@ -1064,7 +1065,7 @@ fn fill_info_from_level<'a>(
     //   name    = call_info[ci_idx - 1].name   (调用者被调用时的名字，若存在)
 
     // 检查最后一个 call_info 条目是否是 C 函数（当前正在执行的 C 函数）
-    let c_func_offset = if state.call_info.last().map(|e| e.is_c).unwrap_or(false) {
+    let c_func_offset = if state.call_info.last().map(|e| e.is_c()).unwrap_or(false) {
         1 // 跳过最后一个 C 函数条目
     } else {
         0
@@ -1087,7 +1088,8 @@ fn fill_info_from_level<'a>(
     // (caller_proto 由 get_caller_proto_ref 从 state.stack[entry.func] 延迟计算)
     let (caller_name, caller_namewhat) = if ci_idx > 0 {
         let prev = &state.call_info[ci_idx - 1];
-        let (_, _, n, nw) = crate::execute::compute_caller_info(&state.stack, prev);
+        let (_, _, n, nw) =
+            crate::execute::compute_caller_info(&state.stack, &state.call_stack, prev);
         (if n.is_empty() { None } else { Some(n) }, nw)
     } else {
         (None, String::new())
@@ -1101,11 +1103,12 @@ fn fill_info_from_level<'a>(
     // 特殊情况: hook 场景中，hook 函数的 entry.base 指向被 hook 的 C 函数
     // （如 assert），此时栈上是 C 函数（LightUserData），应该走 C 函数路径
     // 返回该 C 函数的信息，而不是 fallback 到 entry.closure（hook 函数自身）。
-    let stack_val = if entry.base > 0 && entry.base <= state.top {
-        Some(state.stack[entry.func].clone())
-    } else {
-        None
-    };
+    let stack_val =
+        if entry.base(&state.call_stack) > 0 && entry.base(&state.call_stack) <= state.top {
+            Some(state.stack[entry.func(&state.call_stack)].clone())
+        } else {
+            None
+        };
     let stack_closure = stack_val.as_ref().and_then(|v| {
         if let TValue::LClosure(c) = v {
             Some(c.clone())
@@ -1128,7 +1131,7 @@ fn fill_info_from_level<'a>(
     let closure_opt = if is_stack_c_func {
         None
     } else {
-        stack_closure.or_else(|| entry.closure.clone())
+        stack_closure.or_else(|| entry.closure(&state.stack, &state.call_stack).cloned())
     };
     if let Some(closure) = closure_opt {
         let proto = &closure.proto;
@@ -1156,7 +1159,7 @@ fn fill_info_from_level<'a>(
             .to_string();
         }
         if what.contains('l') {
-            info.currentline = get_proto_line(proto, entry.saved_pc);
+            info.currentline = get_proto_line(proto, entry.saved_pc(&state.call_stack));
         }
         if what.contains('u') {
             info.nups = closure.upvals.borrow().len();
@@ -1175,7 +1178,7 @@ fn fill_info_from_level<'a>(
             // (tail call 重用 entry, 修改 closure 和 is_tailcall, 所以 call_info[ci_idx-1]
             //  在 tail call 后记录的是重用后的函数的 istailcall)
             info.istailcall = if ci_idx > 0 {
-                state.call_info[ci_idx - 1].is_tailcall
+                state.call_info[ci_idx - 1].is_tailcall()
             } else {
                 false
             };
@@ -1222,8 +1225,8 @@ fn fill_info_from_level<'a>(
     }
     // 'f' 选项: 从栈上读取 C 函数值 (entry.func = 函数位置)
     if what.contains('f') {
-        if entry.base > 0 && entry.base <= state.top {
-            info.func = Some(state.stack[entry.func].clone());
+        if entry.base(&state.call_stack) > 0 && entry.base(&state.call_stack) <= state.top {
+            info.func = Some(state.stack[entry.func(&state.call_stack)].clone());
         }
     }
     true
@@ -1250,7 +1253,7 @@ fn fill_info_from_thread<'a>(
     let n = call_info.len();
 
     // 计算 C 函数链长度
-    let c_chain_len = call_info.iter().rev().take_while(|e| e.is_c).count();
+    let c_chain_len = call_info.iter().rev().take_while(|e| e.is_c()).count();
 
     // Level 0 到 c_chain_len-1: C 函数链
     if (level as usize) < c_chain_len {
@@ -1264,8 +1267,8 @@ fn fill_info_from_thread<'a>(
         info.nparams = 0;
         info.isvararg = true;
         if what.contains('n') {
-            info.name = entry.name.map(|s| s.to_string());
-            info.namewhat = entry.namewhat.to_string();
+            info.name = entry.name().map(|s| s.to_string());
+            info.namewhat = entry.namewhat().to_string();
         }
         if what.contains('t') {
             info.istailcall = false;
@@ -1296,7 +1299,8 @@ fn fill_info_from_thread<'a>(
             // 名字来自调用当前帧的 call_info 条目
             let (name, namewhat) = if n > c_chain_len {
                 let name_entry = &call_info[n - 1 - c_chain_len];
-                let (_, _, nm, nw) = crate::execute::compute_caller_info(&ctx.stack, name_entry);
+                let (_, _, nm, nw) =
+                    crate::execute::compute_caller_info(&ctx.stack, &ctx.call_stack, name_entry);
                 (if nm.is_empty() { None } else { Some(nm) }, nw)
             } else {
                 (None, String::new())
@@ -1337,7 +1341,7 @@ fn fill_info_from_thread<'a>(
             }
             if what.contains('t') {
                 info.istailcall = if n > c_chain_len {
-                    call_info[n - 1 - c_chain_len].is_tailcall
+                    call_info[n - 1 - c_chain_len].is_tailcall()
                 } else {
                     false
                 };
@@ -1375,7 +1379,7 @@ fn fill_info_from_thread<'a>(
     let entry = &call_info[target_idx]; // 函数/名字/closure
     let next_entry = &call_info[target_idx + 1]; // source/line（调用者的位置）
 
-    if entry.is_c {
+    if entry.is_c() {
         // C 函数帧
         info.what = "C".to_string();
         info.short_src = "[C]".to_string();
@@ -1385,8 +1389,8 @@ fn fill_info_from_thread<'a>(
         info.nparams = 0;
         info.isvararg = true;
         if what.contains('n') {
-            info.name = entry.name.map(|s| s.to_string());
-            info.namewhat = entry.namewhat.to_string();
+            info.name = entry.name().map(|s| s.to_string());
+            info.namewhat = entry.namewhat().to_string();
         }
         if what.contains('t') {
             info.istailcall = false;
@@ -1404,9 +1408,8 @@ fn fill_info_from_thread<'a>(
 
     // Lua 函数帧 — 从 entry.closure 获取信息（延迟计算: 优先 closure 字段, 回退到栈）
     let closure_ref = entry
-        .closure
-        .as_ref()
-        .or_else(|| crate::state::get_closure_from_stack(&ctx.stack, entry));
+        .closure(&ctx.stack, &ctx.call_stack)
+        .or_else(|| crate::state::get_closure_from_stack(&ctx.stack, &ctx.call_stack, entry));
     if let Some(closure) = closure_ref {
         let proto = &closure.proto;
         info.func = Some(TValue::LClosure(closure.clone()));
@@ -1433,7 +1436,8 @@ fn fill_info_from_thread<'a>(
             .to_string();
         }
         if what.contains('l') {
-            let (_, line, _, _) = crate::execute::compute_caller_info(&ctx.stack, next_entry);
+            let (_, line, _, _) =
+                crate::execute::compute_caller_info(&ctx.stack, &ctx.call_stack, next_entry);
             info.currentline = line;
         }
         if what.contains('u') {
@@ -1442,13 +1446,14 @@ fn fill_info_from_thread<'a>(
             info.isvararg = proto.is_vararg();
         }
         if what.contains('n') {
-            let (_, _, name, namewhat) = crate::execute::compute_caller_info(&ctx.stack, entry);
+            let (_, _, name, namewhat) =
+                crate::execute::compute_caller_info(&ctx.stack, &ctx.call_stack, entry);
             info.name = if name.is_empty() { None } else { Some(name) };
             info.namewhat = namewhat;
         }
         if what.contains('t') {
-            info.istailcall = entry.is_tailcall;
-            info.extraargs = next_entry.nextraargs;
+            info.istailcall = entry.is_tailcall();
+            info.extraargs = next_entry.nextraargs(&ctx.call_stack);
         }
         if what.contains('r') {
             info.ftransfer = 0;
@@ -1555,7 +1560,7 @@ fn get_local_from_thread<'a>(
 
     let call_info = &ctx.call_info;
     let n = call_info.len();
-    let c_chain_len = call_info.iter().rev().take_while(|e| e.is_c).count();
+    let c_chain_len = call_info.iter().rev().take_while(|e| e.is_c()).count();
 
     let read_stack = |idx: usize| -> TValue {
         if idx < ctx.top {
@@ -1572,16 +1577,18 @@ fn get_local_from_thread<'a>(
         if nvar <= 0 {
             return None;
         }
-        // limit: 对于 C 函数链中的帧，limit = 下一帧的函数槽 (call_info[...].func)
+        // limit: 对于 C 函数链中的帧，limit = 下一帧的函数槽 (call_info[...].func(&ctx.call_stack))
         let limit = if idx + 1 < n {
-            call_info[idx + 1].func
+            call_info[idx + 1].func(&ctx.call_stack)
         } else {
             // 最后一帧（level 0），limit = saved_top
             ctx.top
         };
-        let cond = nvar > 0 && limit >= entry.base && (limit - entry.base) >= (nvar as usize);
+        let cond = nvar > 0
+            && limit >= entry.base(&ctx.call_stack)
+            && (limit - entry.base(&ctx.call_stack)) >= (nvar as usize);
         if cond {
-            let stack_idx = entry.base + (nvar as usize) - 1;
+            let stack_idx = entry.base(&ctx.call_stack) + (nvar as usize) - 1;
             return Some(("(C temporary)".to_string(), read_stack(stack_idx)));
         }
         return None;
@@ -1650,16 +1657,18 @@ fn get_local_from_thread<'a>(
     let target_idx = offset;
     let entry = &call_info[target_idx];
 
-    // limit: 下一帧的函数槽 (call_info[...].func)
-    let limit = call_info[target_idx + 1].func;
+    // limit: 下一帧的函数槽 (call_info[...].func(&ctx.call_stack))
+    let limit = call_info[target_idx + 1].func(&ctx.call_stack);
 
-    if entry.is_c {
+    if entry.is_c() {
         if nvar <= 0 {
             return None;
         }
-        let cond = nvar > 0 && limit >= entry.base && (limit - entry.base) >= (nvar as usize);
+        let cond = nvar > 0
+            && limit >= entry.base(&ctx.call_stack)
+            && (limit - entry.base(&ctx.call_stack)) >= (nvar as usize);
         if cond {
-            let stack_idx = entry.base + (nvar as usize) - 1;
+            let stack_idx = entry.base(&ctx.call_stack) + (nvar as usize) - 1;
             return Some(("(C temporary)".to_string(), read_stack(stack_idx)));
         }
         return None;
@@ -1667,19 +1676,18 @@ fn get_local_from_thread<'a>(
 
     // Lua 函数帧
     let closure_ref = entry
-        .closure
-        .as_ref()
-        .or_else(|| crate::state::get_closure_from_stack(&ctx.stack, entry));
+        .closure(&ctx.stack, &ctx.call_stack)
+        .or_else(|| crate::state::get_closure_from_stack(&ctx.stack, &ctx.call_stack, entry));
     if let Some(closure) = closure_ref {
         let proto = &closure.proto;
-        let pc = call_info[target_idx + 1].saved_pc;
+        let pc = call_info[target_idx + 1].saved_pc(&ctx.call_stack);
 
         // 负数索引 (vararg)
         if nvar < 0 {
-            if (entry.proto_flag & PF_VAHID) != 0 {
-                let nextra = entry.nextraargs;
+            if (entry.proto_flag(&ctx.call_stack) & PF_VAHID) != 0 {
+                let nextra = entry.nextraargs(&ctx.call_stack);
                 if nvar >= -nextra {
-                    let pos = (entry.func as i32) - nextra - (nvar + 1);
+                    let pos = (entry.func(&ctx.call_stack) as i32) - nextra - (nvar + 1);
                     let pos = pos as usize;
                     return Some(("(vararg)".to_string(), read_stack(pos)));
                 }
@@ -1689,14 +1697,16 @@ fn get_local_from_thread<'a>(
 
         // 正数索引: 局部变量
         if let Some(name_str) = get_local_name(proto, nvar as usize, pc) {
-            let stack_idx = entry.base + (nvar as usize) - 1;
+            let stack_idx = entry.base(&ctx.call_stack) + (nvar as usize) - 1;
             return Some((name_str, read_stack(stack_idx)));
         }
 
         // 临时变量
-        let cond = nvar > 0 && limit >= entry.base && (limit - entry.base) >= (nvar as usize);
+        let cond = nvar > 0
+            && limit >= entry.base(&ctx.call_stack)
+            && (limit - entry.base(&ctx.call_stack)) >= (nvar as usize);
         if cond {
-            let stack_idx = entry.base + (nvar as usize) - 1;
+            let stack_idx = entry.base(&ctx.call_stack) + (nvar as usize) - 1;
             return Some(("(temporary)".to_string(), read_stack(stack_idx)));
         }
     }
@@ -1719,7 +1729,7 @@ fn set_local_from_thread<'a>(
 
     let call_info = ctx.call_info.clone();
     let n = call_info.len();
-    let c_chain_len = call_info.iter().rev().take_while(|e| e.is_c).count();
+    let c_chain_len = call_info.iter().rev().take_while(|e| e.is_c()).count();
 
     let write_stack = |stack: &mut Vec<TValue<'a>>, idx: usize| {
         if idx < stack.len() {
@@ -1735,13 +1745,15 @@ fn set_local_from_thread<'a>(
             return None;
         }
         let limit = if idx + 1 < n {
-            call_info[idx + 1].func
+            call_info[idx + 1].func(&ctx.call_stack)
         } else {
             ctx.top
         };
-        let cond = nvar > 0 && limit >= entry.base && (limit - entry.base) >= (nvar as usize);
+        let cond = nvar > 0
+            && limit >= entry.base(&ctx.call_stack)
+            && (limit - entry.base(&ctx.call_stack)) >= (nvar as usize);
         if cond {
-            let stack_idx = entry.base + (nvar as usize) - 1;
+            let stack_idx = entry.base(&ctx.call_stack) + (nvar as usize) - 1;
             write_stack(&mut ctx.stack, stack_idx);
             return Some("(C temporary)".to_string());
         }
@@ -1808,15 +1820,17 @@ fn set_local_from_thread<'a>(
     let target_idx = offset;
     let entry = call_info[target_idx].clone();
 
-    let limit = call_info[target_idx + 1].func;
+    let limit = call_info[target_idx + 1].func(&ctx.call_stack);
 
-    if entry.is_c {
+    if entry.is_c() {
         if nvar <= 0 {
             return None;
         }
-        let cond = nvar > 0 && limit >= entry.base && (limit - entry.base) >= (nvar as usize);
+        let cond = nvar > 0
+            && limit >= entry.base(&ctx.call_stack)
+            && (limit - entry.base(&ctx.call_stack)) >= (nvar as usize);
         if cond {
-            let stack_idx = entry.base + (nvar as usize) - 1;
+            let stack_idx = entry.base(&ctx.call_stack) + (nvar as usize) - 1;
             write_stack(&mut ctx.stack, stack_idx);
             return Some("(C temporary)".to_string());
         }
@@ -1825,20 +1839,21 @@ fn set_local_from_thread<'a>(
 
     // Lua 函数帧 — 延迟计算 closure 并 clone Rc 以避免与 write_stack 的可变借用冲突
     let closure_owned: Option<MyRc<crate::objects::LClosure, SlotAlloc>> = entry
-        .closure
-        .as_ref()
+        .closure(&ctx.stack, &ctx.call_stack)
         .cloned()
-        .or_else(|| crate::state::get_closure_from_stack(&ctx.stack, &entry).cloned());
+        .or_else(|| {
+            crate::state::get_closure_from_stack(&ctx.stack, &ctx.call_stack, &entry).cloned()
+        });
     if let Some(closure) = closure_owned {
         let proto = &closure.proto;
-        let pc = call_info[target_idx + 1].saved_pc;
+        let pc = call_info[target_idx + 1].saved_pc(&ctx.call_stack);
 
         // 负数索引 (vararg)
         if nvar < 0 {
-            if (entry.proto_flag & PF_VAHID) != 0 {
-                let nextra = entry.nextraargs;
+            if (entry.proto_flag(&ctx.call_stack) & PF_VAHID) != 0 {
+                let nextra = entry.nextraargs(&ctx.call_stack);
                 if nvar >= -nextra {
-                    let pos = (entry.func as i32) - nextra - (nvar + 1);
+                    let pos = (entry.func(&ctx.call_stack) as i32) - nextra - (nvar + 1);
                     let pos = pos as usize;
                     write_stack(&mut ctx.stack, pos);
                     return Some("(vararg)".to_string());
@@ -1849,15 +1864,17 @@ fn set_local_from_thread<'a>(
 
         // 正数索引: 局部变量
         if let Some(name_str) = get_local_name(proto, nvar as usize, pc) {
-            let stack_idx = entry.base + (nvar as usize) - 1;
+            let stack_idx = entry.base(&ctx.call_stack) + (nvar as usize) - 1;
             write_stack(&mut ctx.stack, stack_idx);
             return Some(name_str);
         }
 
         // 临时变量
-        let cond = nvar > 0 && limit >= entry.base && (limit - entry.base) >= (nvar as usize);
+        let cond = nvar > 0
+            && limit >= entry.base(&ctx.call_stack)
+            && (limit - entry.base(&ctx.call_stack)) >= (nvar as usize);
         if cond {
-            let stack_idx = entry.base + (nvar as usize) - 1;
+            let stack_idx = entry.base(&ctx.call_stack) + (nvar as usize) - 1;
             write_stack(&mut ctx.stack, stack_idx);
             return Some("(temporary)".to_string());
         }
@@ -2858,8 +2875,8 @@ pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> Strin
                 lines.push(make_traceback_line(
                     "[C]",
                     -1,
-                    entry.name.unwrap_or(""),
-                    &entry.namewhat,
+                    entry.name().unwrap_or(""),
+                    entry.namewhat(),
                     false,
                     true,
                     0,
@@ -2874,7 +2891,7 @@ pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> Strin
     //   需从 call_info 的最后一个非 C 条目获取错误发生时的帧信息
     let lua_level = c_chain_len as i32;
     if lua_level >= level {
-        let last_lua_idx = (0..n).rev().find(|&i| !state.call_info[i].is_c);
+        let last_lua_idx = (0..n).rev().find(|&i| !state.call_info[i].is_c());
         let is_error_handler = last_lua_idx.is_some() && {
             let idx = last_lua_idx.unwrap();
             let ci_closure = crate::state::get_closure_for_ci(state, idx);
@@ -2904,35 +2921,43 @@ pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> Strin
                     .as_ref()
                     .map(short_src)
                     .unwrap_or_else(|| "?".to_string());
-                let line = get_proto_line(proto, entry.saved_pc);
+                let line = get_proto_line(proto, entry.saved_pc(&state.call_stack));
                 let is_main = proto.line_defined == 0;
-                let (name, namewhat) = if state.call_info.last().map(|e| e.is_c).unwrap_or(false)
-                    && n >= 2
-                {
-                    let e = &state.call_info[n - 2];
-                    // e 的 caller_proto 回退到前一个条目的 closure (若有)
-                    let prev_fb = if n >= 3 {
-                        state.call_info[n - 3].closure.as_ref().map(|c| &c.proto)
+                let (name, namewhat) =
+                    if state.call_info.last().map(|e| e.is_c()).unwrap_or(false) && n >= 2 {
+                        let e = &state.call_info[n - 2];
+                        // e 的 caller_proto 回退到前一个条目的 closure (若有)
+                        let prev_fb = if n >= 3 {
+                            state.call_info[n - 3]
+                                .closure(&state.stack, &state.call_stack)
+                                .map(|c| &c.proto)
+                        } else {
+                            None
+                        };
+                        let (_, _, nm, nw) = crate::execute::compute_caller_info_with_fallback(
+                            &state.stack,
+                            &state.call_stack,
+                            e,
+                            prev_fb,
+                        );
+                        (nm, nw)
                     } else {
-                        None
+                        // entry 的 caller_proto 回退到前一个条目的 closure (若有)
+                        let prev_fb = if idx > 0 {
+                            state.call_info[idx - 1]
+                                .closure(&state.stack, &state.call_stack)
+                                .map(|c| &c.proto)
+                        } else {
+                            None
+                        };
+                        let (_, _, nm, nw) = crate::execute::compute_caller_info_with_fallback(
+                            &state.stack,
+                            &state.call_stack,
+                            entry,
+                            prev_fb,
+                        );
+                        (nm, nw)
                     };
-                    let (_, _, nm, nw) =
-                        crate::execute::compute_caller_info_with_fallback(&state.stack, e, prev_fb);
-                    (nm, nw)
-                } else {
-                    // entry 的 caller_proto 回退到前一个条目的 closure (若有)
-                    let prev_fb = if idx > 0 {
-                        state.call_info[idx - 1].closure.as_ref().map(|c| &c.proto)
-                    } else {
-                        None
-                    };
-                    let (_, _, nm, nw) = crate::execute::compute_caller_info_with_fallback(
-                        &state.stack,
-                        entry,
-                        prev_fb,
-                    );
-                    (nm, nw)
-                };
                 lines.push(make_traceback_line(
                     &src,
                     line,
@@ -2977,12 +3002,12 @@ pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> Strin
             }
             let entry = &state.call_info[i]; // 函数/名字/closure
             let next_entry = &state.call_info[i + 1]; // source/line（调用者的位置）
-            if entry.is_c {
+            if entry.is_c() {
                 lines.push(make_traceback_line(
                     "[C]",
                     -1,
-                    entry.name.unwrap_or(""),
-                    &entry.namewhat,
+                    entry.name().unwrap_or(""),
+                    entry.namewhat(),
                     false,
                     true,
                     0,
@@ -2990,9 +3015,12 @@ pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> Strin
             } else {
                 // next_entry 的函数槽 = entry 的闭包所在槽 (stack[next_entry.func])
                 // 栈截断时回退到 entry.closure.proto (调用者的 proto)
-                let fallback_proto = entry.closure.as_ref().map(|c| &c.proto);
+                let fallback_proto = entry
+                    .closure(&state.stack, &state.call_stack)
+                    .map(|c| &c.proto);
                 let (src_full, line, _, _) = crate::execute::compute_caller_info_with_fallback(
                     &state.stack,
+                    &state.call_stack,
                     next_entry,
                     fallback_proto,
                 );
@@ -3004,12 +3032,15 @@ pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> Strin
                 let linedefined = closure_ref.map(|c| c.proto.line_defined).unwrap_or(0);
                 // entry 的 caller_proto 回退到前一个条目的 closure (若有)
                 let prev_fallback = if i > 0 {
-                    state.call_info[i - 1].closure.as_ref().map(|c| &c.proto)
+                    state.call_info[i - 1]
+                        .closure(&state.stack, &state.call_stack)
+                        .map(|c| &c.proto)
                 } else {
                     None
                 };
                 let (_, _, name, namewhat) = crate::execute::compute_caller_info_with_fallback(
                     &state.stack,
+                    &state.call_stack,
                     entry,
                     prev_fallback,
                 );
@@ -3019,7 +3050,7 @@ pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> Strin
                     &name,
                     &namewhat,
                     is_main,
-                    entry.is_c,
+                    entry.is_c(),
                     linedefined,
                 ));
             }
@@ -3089,7 +3120,7 @@ fn build_traceback_from_thread(ctx: &crate::state::LuaState, msg: &str, level: i
     }
 
     // 计算 call_info 末尾的 C 函数链长度
-    let c_chain_len = call_info.iter().rev().take_while(|e| e.is_c).count();
+    let c_chain_len = call_info.iter().rev().take_while(|e| e.is_c()).count();
 
     // 输出 C 函数链（level 0 到 c_chain_len-1）
     for i in 0..c_chain_len {
@@ -3104,8 +3135,8 @@ fn build_traceback_from_thread(ctx: &crate::state::LuaState, msg: &str, level: i
             &mut result,
             "[C]",
             -1,
-            entry.name.unwrap_or(""),
-            &entry.namewhat,
+            entry.name().unwrap_or(""),
+            &entry.namewhat(),
             false,
             true,
             0,
@@ -3127,8 +3158,11 @@ fn build_traceback_from_thread(ctx: &crate::state::LuaState, msg: &str, level: i
                 // 名字来自调用当前帧的 call_info 条目
                 let (name, namewhat) = if n > c_chain_len {
                     let name_entry = &call_info[n - 1 - c_chain_len];
-                    let (_, _, nm, nw) =
-                        crate::execute::compute_caller_info(&ctx.stack, name_entry);
+                    let (_, _, nm, nw) = crate::execute::compute_caller_info(
+                        &ctx.stack,
+                        &ctx.call_stack,
+                        name_entry,
+                    );
                     (nm, nw)
                 } else {
                     (String::new(), String::new())
@@ -3160,30 +3194,30 @@ fn build_traceback_from_thread(ctx: &crate::state::LuaState, msg: &str, level: i
             }
             let entry = &call_info[i]; // 函数/名字/closure
             let next_entry = &call_info[i + 1]; // source/line（调用者的位置）
-            if entry.is_c {
+            if entry.is_c() {
                 push_traceback_line(
                     &mut result,
                     "[C]",
                     -1,
-                    entry.name.unwrap_or(""),
-                    &entry.namewhat,
+                    entry.name().unwrap_or(""),
+                    &entry.namewhat(),
                     false,
                     true,
                     0,
                 );
             } else {
                 let (src_full, line, _, _) =
-                    crate::execute::compute_caller_info(&ctx.stack, next_entry);
+                    crate::execute::compute_caller_info(&ctx.stack, &ctx.call_stack, next_entry);
                 let src = short_src_from_source(&src_full);
-                let closure_ref = entry
-                    .closure
-                    .as_ref()
-                    .or_else(|| crate::state::get_closure_from_stack(&ctx.stack, entry));
+                let closure_ref = entry.closure(&ctx.stack, &ctx.call_stack).or_else(|| {
+                    crate::state::get_closure_from_stack(&ctx.stack, &ctx.call_stack, entry)
+                });
                 let is_main = closure_ref
                     .map(|c| c.proto.line_defined == 0)
                     .unwrap_or(false);
                 let linedefined = closure_ref.map(|c| c.proto.line_defined).unwrap_or(0);
-                let (_, _, name, namewhat) = crate::execute::compute_caller_info(&ctx.stack, entry);
+                let (_, _, name, namewhat) =
+                    crate::execute::compute_caller_info(&ctx.stack, &ctx.call_stack, entry);
                 push_traceback_line(
                     &mut result,
                     &src,
@@ -3191,7 +3225,7 @@ fn build_traceback_from_thread(ctx: &crate::state::LuaState, msg: &str, level: i
                     &name,
                     &namewhat,
                     is_main,
-                    entry.is_c,
+                    entry.is_c(),
                     linedefined,
                 );
             }
@@ -3206,7 +3240,7 @@ fn build_traceback_from_thread(ctx: &crate::state::LuaState, msg: &str, level: i
 fn count_c_function_chain(state: &LuaState) -> usize {
     let mut count = 0;
     for i in (0..state.call_info.len()).rev() {
-        if state.call_info[i].is_c {
+        if state.call_info[i].is_c() {
             count += 1;
         } else {
             break;
@@ -3231,18 +3265,20 @@ fn get_current_frame_info(state: &LuaState) -> Option<(String, i32, String, Stri
         let line = get_proto_line(proto, state.pc);
         // 当最后一个 call_info 条目是 C 函数时，跳过它获取 name/namewhat
         // 因为 C 函数条目记录的是 C 函数的调用信息，不是当前 Lua 帧的
-        let (name, namewhat) = if state.call_info.last().map(|e| e.is_c).unwrap_or(false)
+        let (name, namewhat) = if state.call_info.last().map(|e| e.is_c()).unwrap_or(false)
             && state.call_info.len() >= 2
         {
             let entry = &state.call_info[state.call_info.len() - 2];
-            let (_, _, nm, nw) = crate::execute::compute_caller_info(&state.stack, entry);
+            let (_, _, nm, nw) =
+                crate::execute::compute_caller_info(&state.stack, &state.call_stack, entry);
             (nm, nw)
         } else {
             state
                 .call_info
                 .last()
                 .map(|e| {
-                    let (_, _, nm, nw) = crate::execute::compute_caller_info(&state.stack, e);
+                    let (_, _, nm, nw) =
+                        crate::execute::compute_caller_info(&state.stack, &state.call_stack, e);
                     (nm, nw)
                 })
                 .unwrap_or((String::new(), String::new()))

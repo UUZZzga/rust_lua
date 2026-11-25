@@ -424,18 +424,17 @@ pub(crate) fn call_tm_res<'a>(
     let caller_closure = state.closure.clone();
     let caller_tbc_list = state.tbc_list;
     // perf: caller_proto 延迟计算 (同 op_call), 从 state.stack[entry.func] 获取
-    state.call_info.push(crate::state::CallInfoEntry {
-        is_c: false,
-        closure: None,
-        base: caller_base,
-        func: state.cur_func(),
-        saved_pc: caller_pc,
-        name: Some(tm.event_name()),
-        namewhat: "metamethod",
-        proto_flag: caller_proto_flag,
-        nextraargs: caller_nextraargs,
-        is_tailcall: false,
-    });
+    state.call_info.push(crate::state::CallInfoEntry::full(
+        false,
+        None,
+        caller_base,
+        state.cur_func(),
+        caller_pc,
+        Some(tm.event_name()),
+        "metamethod",
+        caller_proto_flag,
+        caller_nextraargs,
+    ));
 
     // Push PcallProtection — 元方法 continuation 机制
     // yield 穿过元方法后，resume 时元方法返回，op_return 检测到 is_metamethod=true
@@ -585,18 +584,17 @@ pub(crate) fn call_tm<'a>(
     let caller_closure = state.closure.clone();
     let caller_tbc_list = state.tbc_list;
     // perf: caller_proto 延迟计算 (同 op_call), 从 state.stack[entry.func] 获取
-    state.call_info.push(crate::state::CallInfoEntry {
-        is_c: false,
-        closure: None,
-        base: caller_base,
-        func: state.cur_func(),
-        saved_pc: caller_pc,
-        name: Some(tm.event_name()),
-        namewhat: "metamethod",
-        proto_flag: caller_proto_flag,
-        nextraargs: caller_nextraargs,
-        is_tailcall: false,
-    });
+    state.call_info.push(crate::state::CallInfoEntry::full(
+        false,
+        None,
+        caller_base,
+        state.cur_func(),
+        caller_pc,
+        Some(tm.event_name()),
+        "metamethod",
+        caller_proto_flag,
+        caller_nextraargs,
+    ));
 
     // Push PcallProtection — 元方法 continuation 机制
     // saved_pc 保留指向被中断的指令 (SETTABLE/SETI/SETFIELD), 不 +1,
@@ -756,18 +754,17 @@ pub fn call_close_method<'a>(
     let caller_base = state.base;
     let caller_pc = state.pc;
     // perf: caller_proto 延迟计算 (同 op_call), 从 state.stack[entry.func] 获取
-    state.call_info.push(crate::state::CallInfoEntry {
-        is_c: false,
-        closure: None,
-        base: caller_base,
-        func: state.cur_func(),
-        saved_pc: caller_pc,
-        name: Some("close"),
-        namewhat: "metamethod",
-        proto_flag: state.proto_flag,
-        nextraargs: state.nextraargs,
-        is_tailcall: false,
-    });
+    state.call_info.push(crate::state::CallInfoEntry::full(
+        false,
+        None,
+        caller_base,
+        state.cur_func(),
+        caller_pc,
+        Some("close"),
+        "metamethod",
+        state.proto_flag,
+        state.nextraargs,
+    ));
 
     // Push PcallProtection — close continuation 机制
     // yield 穿过 __close 后，resume 时 __close 返回，op_return 检测到 is_close_continuation=true

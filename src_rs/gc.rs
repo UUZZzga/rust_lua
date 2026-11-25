@@ -1743,7 +1743,8 @@ impl<'a> LuaState<'a> {
         }
 
         for ci in &self.call_info {
-            if let Some(closure) = &ci.closure {
+            // 薄条目的被调闭包经 stack[frame.func] 派生; 合成条目读显式 closure
+            if let Some(closure) = ci.closure(&self.stack, &self.call_stack) {
                 let tv = TValue::LClosure(closure.clone());
                 unsafe { worklist.push(raw_from_tvalue(&tv)) };
                 drop(tv);
@@ -1846,7 +1847,8 @@ impl<'a> LuaState<'a> {
             }
         }
         for ci in &exec.call_info {
-            if let Some(ref closure) = ci.closure {
+            // 薄条目的被调闭包经 stack[frame.func] 派生; 合成条目读显式 closure
+            if let Some(closure) = ci.closure(&exec.stack, &exec.call_stack) {
                 let tv = TValue::LClosure(closure.clone());
                 unsafe { worklist.push(raw_from_tvalue(&tv)) };
                 drop(tv);
@@ -2264,18 +2266,17 @@ impl<'a> LuaState<'a> {
             self.push_value(gc_func);
             self.push_value(obj_val);
 
-            self.call_info.push(CallInfoEntry {
-                is_c: false,
-                closure: None,
-                base: self.base,
-                func: (self.base).saturating_sub(1),
-                saved_pc: self.pc,
-                name: Some("__gc"),
-                namewhat: "metamethod",
-                proto_flag: self.proto_flag,
-                nextraargs: self.nextraargs,
-                is_tailcall: false,
-            });
+            self.call_info.push(CallInfoEntry::full(
+                false,
+                None,
+                self.base,
+                (self.base).saturating_sub(1),
+                self.pc,
+                Some("__gc"),
+                "metamethod",
+                self.proto_flag,
+                self.nextraargs,
+            ));
 
             let status = self.pcall(1, 0, 0);
             if status != 0 && self.exit_requested.is_none() {

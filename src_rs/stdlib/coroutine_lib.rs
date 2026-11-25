@@ -1632,18 +1632,18 @@ fn setup_first_resume<'a>(
         // 推入初始 CallInfoEntry — 对应 C 中协程的 base CallInfo
         // 记录协程主函数的信息，使 traceback/getinfo 能正确显示最外层帧
         // perf: caller_proto 延迟计算, 从 co.stack[0] (= base-1) 获取主函数 proto
-        co.call_info = vec![crate::state::CallInfoEntry {
-            is_c: false,
-            closure: Some(closure.clone()),
-            base: 1,
-            func: 0, // 体函数在 stack[0]（base = 1），故函数槽 = 0
-            saved_pc: 0,
-            name: None,
-            namewhat: "",
-            proto_flag: closure.proto.flag,
-            nextraargs: 0,
-            is_tailcall: false,
-        }];
+        // 合成条目: 协程主函数无对应 call_stack 帧, 走 Full 自包含
+        co.call_info = vec![crate::state::CallInfoEntry::full(
+            false,
+            Some(closure.clone()),
+            1,
+            0, // 体函数在 stack[0]（base = 1），故函数槽 = 0
+            0,
+            None,
+            "",
+            closure.proto.flag,
+            0,
+        )];
     } else if is_callable(&func) {
         // C 函数 (LightUserData/CClosure/LCFn/BuiltinFn) 或带 __call 元方法的 Table:
         // 创建 CALL + RETURN 序列
@@ -1701,7 +1701,7 @@ fn setup_subsequent_resume<'a>(
     // pop 掉 yield 时保留的 C 函数 CallInfoEntry
     // 对应 C 中 yield 的 C 函数返回后 ci 被正常 pop
     // （Rust 中 yield 通过 Err(Yield) 返回，op_call 跳过了 pop，这里补偿）
-    if co.call_info.last().map(|e| e.is_c).unwrap_or(false) {
+    if co.call_info.last().map(|e| e.is_c()).unwrap_or(false) {
         co.call_info.pop();
     }
 

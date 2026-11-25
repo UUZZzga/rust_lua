@@ -143,43 +143,43 @@ impl<'io> Interpreter<'io> {
                                 > = None;
                                 let mut error_pc: usize = 0;
                                 for entry in err_ci.iter() {
-                                    if let Some(c) = &entry.closure {
+                                    if let Some(c) =
+                                        entry.closure(&self.l.stack, &self.l.call_stack)
+                                    {
                                         main_closure = Some(c.clone());
                                     }
-                                    if entry.is_c && entry.saved_pc > 0 {
-                                        error_pc = entry.saved_pc;
+                                    if entry.is_c() && entry.saved_pc(&self.l.call_stack) > 0 {
+                                        error_pc = entry.saved_pc(&self.l.call_stack);
                                     }
                                 }
                                 // 构造 main chunk 帧: "C 调用者 → main chunk"
                                 // saved_pc = error_pc（error(m) 的 pc），让 debug.getinfo(4)
                                 // 返回 main chunk 的 currentline = error(m) 的行号
                                 if let Some(mc) = &main_closure {
-                                    constructed_ci.push(crate::state::CallInfoEntry {
-                                        is_c: true, // C 调用者
-                                        closure: Some(mc.clone()),
-                                        base: 0,
-                                        func: 0,
-                                        saved_pc: error_pc, // error(m) 的 pc
-                                        name: None,
-                                        namewhat: "",
-                                        proto_flag: mc.proto.flag,
-                                        nextraargs: 0,
-                                        is_tailcall: false,
-                                    });
+                                    constructed_ci.push(crate::state::CallInfoEntry::full(
+                                        true, // C 调用者
+                                        Some(mc.clone()),
+                                        0,
+                                        0,
+                                        error_pc, // error(m) 的 pc
+                                        None,
+                                        "",
+                                        mc.proto.flag,
+                                        0,
+                                    ));
                                 }
                                 // 推入 msghandler C 函数帧
-                                constructed_ci.push(crate::state::CallInfoEntry {
-                                    is_c: true,
-                                    closure: None,
-                                    base: 0,
-                                    func: 0,
-                                    saved_pc: 0,
-                                    name: Some("msghandler"),
-                                    namewhat: "",
-                                    proto_flag: 0,
-                                    nextraargs: 0,
-                                    is_tailcall: false,
-                                });
+                                constructed_ci.push(crate::state::CallInfoEntry::full(
+                                    true,
+                                    None,
+                                    0,
+                                    0,
+                                    0,
+                                    Some("msghandler"),
+                                    "",
+                                    0,
+                                    0,
+                                ));
                             }
                             self.l.call_info = constructed_ci;
                             let status = self.l.pcall(1, 1, 0);

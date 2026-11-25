@@ -2589,7 +2589,8 @@ pub extern "C-unwind" fn lua_getinfo(
     if ci_idx >= L.call_info.len() {
         return 0;
     }
-    let ci = L.call_info[ci_idx].clone();
+    // 物化为自包含条目 — Lua 薄条目经当前帧派生字段（帧存活），后续按字段直读
+    let ci = crate::state::materialize_entry_slices(&L.stack, &L.call_stack, &L.call_info[ci_idx]);
 
     // 静态 C 字符串常量
     static WHAT_C: &[u8] = b"C\0";

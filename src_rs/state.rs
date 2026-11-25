@@ -850,6 +850,32 @@ impl<'a> LuaState<'a> {
         }
     }
 
+    /// 把单个 call_info 条目物化为自包含 [`FullCallInfo`]（快照/跨上下文用）。
+    ///
+    /// Lua 帧条目经当前 `call_stack`/`stack` 派生字段（帧必须存活 —— 调用点须保证
+    /// 条目与帧生命周期一致：错误快照、pcall/hook 换出 call_stack 前、协程错误
+    /// 处理中）。合成条目原样克隆。
+    pub fn materialize_entry(&self, entry: &CallInfoEntry<'a>) -> FullCallInfo<'a> {
+        materialize_entry_slices(&self.stack, &self.call_stack, entry)
+    }
+
+    /// 物化整个 call_info（全部转为自包含条目）—— 错误快照用。
+    ///
+    /// 之后即使 `call_stack`/`stack` 被截断/换出，快照仍可独立解析（traceback、
+    /// `debug.getinfo`、last_error_call_info 消费点）。
+    pub fn materialize_call_info(&self) -> Vec<CallInfoEntry<'a>> {
+        self.call_info
+            .iter()
+            .map(|e| {
+                CallInfoEntry::Full(Box::new(materialize_entry_slices(
+                    &self.stack,
+                    &self.call_stack,
+                    e,
+                )))
+            })
+            .collect()
+    }
+
     /// 当前帧寄存器写边界 (exclusive) —— 保守取 `anchor + MAX_FSTACK + 1`。
     ///
     /// anchor = 帧基址 (base 有效时) 否则栈长: 保证覆盖「base + 寄存器号」形式的写
@@ -1226,7 +1252,7 @@ impl<'a> LuaState<'a> {
         // call_info 为空，不应推迟。
         if self.hook_mask & 2 != 0 && self.allowhook {
             // LUA_MASKRET
-            let in_op_call = self.call_info.last().map(|e| e.is_c).unwrap_or(false);
+            let in_op_call = self.call_info.last().map(|e| e.is_c()).unwrap_or(false);
             if in_op_call {
                 let first_result_pos = self.top;
                 // perf: 用 into_iter drain 避免 clone (每个 results[i].clone() 对 Rc 变体需 incq)
@@ -1289,7 +1315,7 @@ impl<'a> LuaState<'a> {
     #[cfg_attr(not(size_optimized), inline)]
     pub fn adjust_single_result(&mut self, a: usize, nresults: i32, result: TValue<'a>) {
         if self.hook_mask & 2 != 0 && self.allowhook {
-            let in_op_call = self.call_info.last().map(|e| e.is_c).unwrap_or(false);
+            let in_op_call = self.call_info.last().map(|e| e.is_c()).unwrap_or(false);
             if in_op_call {
                 // 结果必须放在 live top 之上（不是 len == capacity 的已初始化槽位数）；
                 // return hook 的 ftransfer 由 first_result_pos 反推，用 len 会得到巨大偏移
@@ -1377,7 +1403,7 @@ impl<'a> LuaState<'a> {
     /// adjust_results 的双值版本 — 消除 vec![v1, v2] 堆分配（gsub 返回 热点）。
     pub fn adjust_two_results(&mut self, a: usize, nresults: i32, v1: TValue<'a>, v2: TValue<'a>) {
         if self.hook_mask & 2 != 0 && self.allowhook {
-            let in_op_call = self.call_info.last().map(|e| e.is_c).unwrap_or(false);
+            let in_op_call = self.call_info.last().map(|e| e.is_c()).unwrap_or(false);
             if in_op_call {
                 let first_result_pos = self.top;
                 self.push_value(v1);
@@ -1421,7 +1447,7 @@ impl<'a> LuaState<'a> {
         first_result_pos: usize,
     ) {
         if self.hook_mask & 2 != 0 && self.allowhook {
-            let in_op_call = self.call_info.last().map(|e| e.is_c).unwrap_or(false);
+            let in_op_call = self.call_info.last().map(|e| e.is_c()).unwrap_or(false);
             if in_op_call {
                 self.pending_return_adjust = Some((a, nresults, n_actual, first_result_pos));
                 return;
@@ -1666,12 +1692,11 @@ impl<'a> LuaState<'a> {
                     && self.base <= self.top
                     && matches!(&self.stack[self.cur_func()], TValue::LClosure(_));
                 let already_has_entry = self.call_info.last().map_or(false, |e| {
-                    e.closure
-                        .as_ref()
+                    e.closure(&self.stack, &self.call_stack)
                         .map_or(false, |c| Rc::ptr_eq(&c.proto, &proto))
-                        || get_closure_from_stack(&self.stack, e)
+                        || get_closure_from_stack(&self.stack, &self.call_stack, e)
                             .map_or(false, |c| Rc::ptr_eq(&c.proto, &proto))
-                        || (!e.namewhat.is_empty() && !e.is_c)
+                        || (!e.namewhat().is_empty() && !e.is_c())
                 });
                 let pushed_call_info = !already_has_entry;
                 if pushed_call_info {
@@ -1681,19 +1706,19 @@ impl<'a> LuaState<'a> {
                         // C 调用者: base=0, saved_pc=0
                         (0usize, 0usize)
                     };
-                    self.call_info.push(crate::state::CallInfoEntry {
-                        is_c: !caller_is_lua,
-                        // move closure 避免 clone + Box 堆分配
-                        closure: Some(closure),
-                        base: caller_base,
-                        func: self.cur_func(),
-                        saved_pc: caller_pc,
-                        name: None,
-                        namewhat: "",
-                        proto_flag: self.proto_flag,
-                        nextraargs: self.nextraargs,
-                        is_tailcall: false,
-                    });
+                    // pcall 条目无对应 call_stack 帧（call_stack 即将被整体换出），
+                    // 且记录的是「调用者信息 + 被调闭包」的合成形态 —— 走 Full 自包含。
+                    self.call_info.push(crate::state::CallInfoEntry::full(
+                        !caller_is_lua,
+                        Some(closure),
+                        caller_base,
+                        self.cur_func(),
+                        caller_pc,
+                        None,
+                        "",
+                        self.proto_flag,
+                        self.nextraargs,
+                    ));
                 } else {
                     // 不需要 closure，drop 它
                     drop(closure);
@@ -1781,6 +1806,19 @@ impl<'a> LuaState<'a> {
                 // 注意: 不清空 call_info，因为 op_return 只在 call_stack.pop() 成功时
                 // 才 pop call_info（call_stack 为空时不会 pop），且调用者（如 call_hook）
                 // 可能已 push call_info 供 debug.getinfo 使用。
+                // 窗口前的 Lua 薄条目 frame_idx 指向即将被换出的 call_stack 帧。
+                // 窗口内（受保护函数体执行期间，如 __close 元方法经 call_close_method
+                // 的 state.pcall 调用）getinfo/traceback 若读取外层条目，帧不可达
+                // ——先物化为自包含 Full 条目（帧此刻仍存活，快照即实时派生值）。
+                for e in self.call_info[..saved_call_info_len].iter_mut() {
+                    if matches!(e, CallInfoEntry::Lua { .. }) {
+                        *e = CallInfoEntry::Full(Box::new(materialize_entry_slices(
+                            &self.stack,
+                            &self.call_stack,
+                            e,
+                        )));
+                    }
+                }
                 let saved_call_stack_frames = std::mem::take(&mut self.call_stack);
 
                 // 执行受保护函数体。这里同时是**内存错误的保护边界**:
@@ -1874,10 +1912,42 @@ impl<'a> LuaState<'a> {
                 //   由 finish_pcall_return 恢复。不合并到 call_stack: 否则 resume 后内层帧 pop 完
                 //   会错误 pop 外层帧，导致 state.exec.base 跳过 pcall 的 func_idx+1。
                 //   外层帧持有 Rc 引用（code/constants/protos 等），必须保存以防释放后悬空指针。
+                // 错误路径: 在 1912 行用外层栈覆盖 call_stack 之前，物化错误快照。
+                // 内层 Lua 薄条目的 frame_idx 指向内层栈（g/auxy 等被保护函数的帧），
+                // 覆盖后全部失效 —— stack overflow 的 traceback 会退化为 "?: in function <?:0>"。
+                // 协程路径（execute_loop 错误处理）可能已存快照，不覆盖。
+                // 先截断到 saved_call_info_len 再物化（对齐 C 的 L->ci = old_ci）:
+                // 错误展开中 C 函数（如 error()）推入的条目不应进入快照 —— C 5.5 的
+                // C 函数调用不产生 CallInfo，traceback 不显示 error 帧；若残留进快照，
+                // 会被外层 pcall（xpcall 等）take 复用，导致 c_chain 判定错位、
+                // 元方法帧（"in metamethod 'newindex'"）被当作当前 Lua 帧而丢失。
+                if result.is_err() && self.last_error_call_info.is_none() {
+                    // 物化全量 call_info（对齐基线 clone 全量语义）：此刻 call_stack
+                    // 尚未被外层栈覆盖（1930 行），内层 Lua 薄条目的 frame_idx 仍可解析。
+                    // 不可先 truncate 到 saved_call_info_len —— 会把栈溢出等场景下
+                    // 大量内层 Lua 帧删掉，traceback 退化为 "?: in function <?:0>"。
+                    // 错误展开期间 C 函数（error() 等）推入的条目也保留在快照中
+                    // （与基线一致），由 traceback 消费端的 c_chain 判定处理。
+                    self.last_error_call_info = Some(self.materialize_call_info());
+                }
                 if !matches!(&result, Ok(VmResult::Yield { .. })) {
                     self.call_stack = saved_call_stack_frames;
                 } else {
-                    // yield: 只保留内层残留帧（被中断的调用），外层帧保存到 PcallProtection
+                    // yield: 外层帧即将移出 self.call_stack（保存到 PcallProtection）。
+                    // call_info 中引用外层帧的 Lua 薄条目（frame_idx 相对外层向量）
+                    // 必须先物化为自包含条目，否则挂起期间/恢复后 frame_idx 与
+                    // self.call_stack（只剩内层帧）错位。
+                    // 内层条目引用 self.call_stack 的内层帧，索引仍然有效，保持薄条目。
+                    for e in self.call_info[..saved_call_info_len].iter_mut() {
+                        if matches!(e, CallInfoEntry::Lua { .. }) {
+                            *e = CallInfoEntry::Full(Box::new(materialize_entry_slices(
+                                &self.stack,
+                                &saved_call_stack_frames,
+                                e,
+                            )));
+                        }
+                    }
+                    // 只保留内层残留帧（被中断的调用），外层帧保存到 PcallProtection
                     let pp_len = self.pcall_protection_stack.len();
                     // 向下查找第一个未填充的 PcallProtection（与下方 saved_filled 更新逻辑一致）
                     let target_idx = if pp_len > 0 {
@@ -1895,7 +1965,17 @@ impl<'a> LuaState<'a> {
                         }
                         None => {
                             // fallback: 找不到目标 PcallProtection（嵌套 yield 场景）时，
-                            // 合并到 call_stack 以避免丢弃 Rc 引用导致悬空指针
+                            // 合并到 call_stack 以避免丢弃 Rc 引用导致悬空指针。
+                            // 合并会平移内层帧索引 —— 内层薄条目也须物化。
+                            for e in self.call_info[saved_call_info_len..].iter_mut() {
+                                if matches!(e, CallInfoEntry::Lua { .. }) {
+                                    *e = CallInfoEntry::Full(Box::new(materialize_entry_slices(
+                                        &self.stack,
+                                        &self.call_stack,
+                                        e,
+                                    )));
+                                }
+                            }
                             let remaining = std::mem::take(&mut self.call_stack);
                             let mut combined = saved_call_stack_frames;
                             combined.extend(remaining);
@@ -2004,7 +2084,25 @@ impl<'a> LuaState<'a> {
                             // 恢复此快照，让 debug.traceback 能看到错误发生时的帧（如 __close 帧）。
                             // 如果有 __close 帧（call_close_method 出错时保存到 last_close_frame），
                             // 追加到快照末尾，模拟 C Lua 中 CallInfo 节点保留在链表中的行为。
-                            let mut snapshot = self.call_info.clone();
+                            // 物化快照: Lua 薄条目解引用为自包含条目。
+                            // 优先复用 execute_loop 错误路径（call_stack.clear() 前）已物化的
+                            // 快照 —— 此刻 call_stack 已被清空，frame_idx 无法解析；
+                            // 兜底物化仅用于不经 execute_loop 的错误（C 路径等）。
+                            let mut snapshot = match self.last_error_call_info.take() {
+                                Some(mut pre) => {
+                                    // 复用内层 pcall 已物化的快照。内层 pcall 存回快照后
+                                    // 会 truncate 掉保护范围内推入的条目（对应 C 的
+                                    // L->ci = old_ci），基线每层 pcall 克隆的是 truncate
+                                    // 之后的 call_info —— 因此快照须与当前 call_info
+                                    // 长度对齐，丢弃内层已移除的尾部条目（如错误展开期
+                                    // 推入的 error() C 帧）。
+                                    if pre.len() > self.call_info.len() {
+                                        pre.truncate(self.call_info.len());
+                                    }
+                                    pre
+                                }
+                                None => self.materialize_call_info(),
+                            };
                             if let Some(ref close_frame) = self.last_close_frame {
                                 snapshot.push(close_frame.clone());
                             }
@@ -2268,18 +2366,17 @@ impl<'a> LuaState<'a> {
         // pcall 路径下，调用者是 pcall（内部 C 函数），不是 Lua 函数，
         // caller_proto 延迟计算为 None 表示无法从代码分析函数名，
         // lua_getinfo("n") 返回 NULL，触发 luaL_argerror 调用 pushglobalfuncname 查找全局名。
-        self.call_info.push(crate::state::CallInfoEntry {
-            is_c: true,
-            closure: None,
-            base: func_idx + 1,
-            func: func_idx,
-            saved_pc: 0,
-            name: None,
-            namewhat: "",
-            proto_flag: self.proto_flag,
-            nextraargs: self.nextraargs,
-            is_tailcall: false,
-        });
+        self.call_info.push(crate::state::CallInfoEntry::full(
+            true,
+            None,
+            func_idx + 1,
+            func_idx,
+            0,
+            None,
+            "",
+            self.proto_flag,
+            self.nextraargs,
+        ));
 
         // 清空 pending_error，捕获 C 函数中 lua_error 触发的错误
         // 对应 C 的 longjmp 跨 C 函数抛错到 pcall 的 setjmp
@@ -2424,18 +2521,17 @@ impl<'a> LuaState<'a> {
         let saved_call_info_len = self.call_info.len();
 
         // 推入 CallInfoEntry，让 debug.getinfo/traceback 能正确看到 C 函数帧
-        self.call_info.push(crate::state::CallInfoEntry {
-            is_c: true,
-            closure: None,
-            base: func_idx + 1,
-            func: func_idx,
-            saved_pc: 0,
-            name: Some(name),
-            namewhat: "function",
-            proto_flag: self.proto_flag,
-            nextraargs: self.nextraargs,
-            is_tailcall: false,
-        });
+        self.call_info.push(crate::state::CallInfoEntry::full(
+            true,
+            None,
+            func_idx + 1,
+            func_idx,
+            0,
+            Some(name),
+            "function",
+            self.proto_flag,
+            self.nextraargs,
+        ));
 
         // 直接调用函数指针 — 无 tag 派发层
         let dispatch_result: Result<(), crate::execute::VmError> =
@@ -3107,59 +3203,289 @@ unsafe extern "C-unwind" fn protected_exec_trampoline(p: *mut std::ffi::c_void) 
     0
 }
 
-/// 调用栈条目 — 用于堆栈回溯和 debug.getinfo
+/// 自包含调用栈条目 — C 函数 / hook / 元方法 / pcall / 协程主函数等**合成**条目。
+///
+/// 与 [`CallInfoEntry::Lua`] 的区别：这类条目没有与 `op_call` 同步压入的
+/// [`CallFrame`]（或其字段无法从帧派生，如记录「调用者信息 + 被调闭包」的
+/// pcall 条目），故所有字段在 push 时一次性写死。
 #[derive(Debug, Clone)]
-pub struct CallInfoEntry<'a> {
+pub struct FullCallInfo<'a> {
+    /// 对应旧字段的 `is_c`：是否为 C 函数帧条目。
+    /// hook / 元方法 / `__gc` / pcall(Lua 调用者) 条目为 false —— 语义与 C 的
+    /// `isLua(ci)` 判定一致，`in_op_call`（return hook 推迟判定）依赖它。
     pub is_c: bool,
-    /// Lua 函数引用（C 函数为 None）
+    /// 是否为尾调用（对应 C 的 CIST_TAIL）— op_tailcall 复用当前条目时置 true
+    pub is_tailcall: bool,
+    /// Lua 函数引用（C 函数为 None；元方法条目为 None，回退到栈槽读取）
     pub closure: Option<MyRc<crate::objects::LClosure<'a>, SlotAlloc>>,
     /// 栈帧基址（对应 C 的 ci->func + 1）
-    /// Lua 函数帧: caller's base (state.exec.base before op_call updates it)
-    /// C 函数帧: callee's base (func_idx + 1)
-    /// perf: 用于从 state.exec.stack[func] 延迟计算 caller_proto, 避免 op_call 中 Rc::clone
     pub base: usize,
     /// 本条目隐含的函数槽 = `base - 1`（`base == 0` 的无效条目为 0）。
-    ///
-    /// 取「这一条目的函数槽」一律读此字段，**不要再写 `entry.base - 1`** ——
-    /// 与 `base` 一样按条目类型统一：
-    /// - Lua 帧条目（`op_call` / `call_hook` / 元方法 / 宏 pcall 压入）: 值是
-    ///   **触发该调用/事件的帧**的函数槽（与同一深度的 `base`/`saved_pc` 同源，
-    ///   而 `closure` 记的是被调闭包）；
-    /// - C 函数帧条目: 值是**该 C 函数自身**的槽位（`base` 亦为自身 base）。
+    /// 取「这一条目的函数槽」一律读此字段，**不要再写 `base - 1`**。
     pub func: usize,
     /// 调用时的 PC（用于计算 currentline）
     pub saved_pc: usize,
-    /// 函数名（C 函数帧/hook/metamethod 预设置；Lua 函数帧默认 None，traceback 时实时计算）
-    /// perf: 用 Option<&'static str> 替代 String, 避免 op_call 热路径中 String::new 的 24 字节开销
+    /// 函数名（C 函数帧/hook/metamethod 预设置；其余 None，traceback 时实时计算）
     pub name: Option<&'static str>,
     /// 函数名类型: "local", "global", "method", "field", "hook", "metamethod", ""
-    /// （C 函数帧/hook/metamethod 预设置；Lua 函数帧默认空，traceback 时实时计算）
-    /// perf: 用 &'static str 替代 String, 所有值均为静态字符串
     pub namewhat: &'static str,
     /// 调用者的 proto_flag（PF_VAHID / PF_VATAB）— 用于 debug.getlocal level > 1
     pub proto_flag: u8,
     /// 调用者的 nextraargs — 用于 debug.getlocal level > 1 的 vararg 访问
     pub nextraargs: i32,
-    /// 是否为尾调用（对应 C 的 CIST_TAIL）— debug.getinfo(1).istailcall
-    pub is_tailcall: bool,
 }
 
-/// 从栈切片延迟计算 closure 引用 — 核心逻辑
+/// 调用栈条目 — 用于堆栈回溯和 debug.getinfo
 ///
-/// 对于 Lua 函数帧: closure = stack[entry.func] (若为 LClosure)
-/// 对于 C 函数帧: 返回 None
+/// 双形态设计（perf: 每次 Lua 调用只写 16B 枚举而非 72B 结构体）：
+/// - [`CallInfoEntry::Lua`]：op_call / op_tailcall / TFORCALL 与 [`CallFrame`]
+///   **同一次**压入的 Lua 帧条目，仅存帧索引 —— 全部字段经
+///   `call_stack[frame_idx]` 派生（见 [`materialize_entry_slices`] 的字段对应表）。
+/// - [`CallInfoEntry::Full`]：无对应帧的合成条目（C 函数 / hook / 元方法 /
+///   pcall / 协程主函数），自包含、堆盒装（低频路径）。
+#[derive(Debug, Clone)]
+pub enum CallInfoEntry<'a> {
+    /// Lua 帧薄条目 — 指向与本次调用一起压入的 `call_stack` 帧。
+    /// 帧存活期与条目一致（push/pop 同步）；字段派生关系见
+    /// [`materialize_entry_slices`]。
+    Lua { frame_idx: u32, is_tailcall: bool },
+    /// C 帧 / hook / 元方法 / pcall 等自包含条目
+    Full(Box<FullCallInfo<'a>>),
+}
+
+impl<'a> CallInfoEntry<'a> {
+    /// 构造自包含条目（C 函数 / hook / 元方法 / pcall 等合成帧）。
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn full(
+        is_c: bool,
+        closure: Option<MyRc<crate::objects::LClosure<'a>, SlotAlloc>>,
+        base: usize,
+        func: usize,
+        saved_pc: usize,
+        name: Option<&'static str>,
+        namewhat: &'static str,
+        proto_flag: u8,
+        nextraargs: i32,
+    ) -> Self {
+        Self::Full(Box::new(FullCallInfo {
+            is_c,
+            is_tailcall: false,
+            closure,
+            base,
+            func,
+            saved_pc,
+            name,
+            namewhat,
+            proto_flag,
+            nextraargs,
+        }))
+    }
+
+    /// 是否为 C 函数帧条目（对应 C 的 `!isLua(ci)`）。
+    ///
+    /// 语义与旧 `is_c` 字段完全一致：hook / 元方法 / `__gc` / pcall(Lua 调用者)
+    /// 条目为 false —— `in_op_call`（return hook 推迟判定）与 traceback 的
+    /// `c_chain_len` 都依赖此语义。
+    #[inline]
+    pub fn is_c(&self) -> bool {
+        matches!(self, Self::Full(f) if f.is_c)
+    }
+
+    /// 是否为尾调用（对应 C 的 CIST_TAIL）— debug.getinfo(1).istailcall
+    #[inline]
+    pub fn is_tailcall(&self) -> bool {
+        match self {
+            Self::Lua { is_tailcall, .. } => *is_tailcall,
+            Self::Full(f) => f.is_tailcall,
+        }
+    }
+
+    /// 函数名（Lua 帧条目恒 None，traceback 时实时计算）
+    #[inline]
+    pub fn name(&self) -> Option<&'static str> {
+        match self {
+            Self::Lua { .. } => None,
+            Self::Full(f) => f.name,
+        }
+    }
+
+    /// 函数名类型（Lua 帧条目恒空，traceback 时实时计算）
+    #[inline]
+    pub fn namewhat(&self) -> &'static str {
+        match self {
+            Self::Lua { .. } => "",
+            Self::Full(f) => f.namewhat,
+        }
+    }
+
+    /// 栈帧基址（对应 C 的 ci->func + 1）
+    #[inline]
+    pub fn base(&self, call_stack: &[crate::objects::CallFrame<'a>]) -> usize {
+        match self {
+            Self::Lua { frame_idx, .. } => {
+                call_stack.get(*frame_idx as usize).map_or(0, |f| f.base)
+            }
+            Self::Full(f) => f.base,
+        }
+    }
+
+    /// 本条目隐含的函数槽 = `base - 1`（`base == 0` 的无效条目为 0）。
+    ///
+    /// - Lua 帧条目: **触发该调用的帧**（调用者）的函数槽（与同深度的
+    ///   `base`/`saved_pc` 同源，而 [`Self::closure`] 记的是被调闭包）；
+    /// - C 函数帧条目: 该 C 函数自身的槽位。
+    #[inline]
+    pub fn func(&self, call_stack: &[crate::objects::CallFrame<'a>]) -> usize {
+        match self {
+            Self::Lua { frame_idx, .. } => call_stack
+                .get(*frame_idx as usize)
+                .map_or(0, |f| f.base.saturating_sub(1)),
+            Self::Full(f) => f.func,
+        }
+    }
+
+    /// 调用时的 PC（用于计算 currentline）
+    #[inline]
+    pub fn saved_pc(&self, call_stack: &[crate::objects::CallFrame<'a>]) -> usize {
+        match self {
+            Self::Lua { frame_idx, .. } => call_stack
+                .get(*frame_idx as usize)
+                .map_or(0, |f| f.return_pc.saturating_sub(1)),
+            Self::Full(f) => f.saved_pc,
+        }
+    }
+
+    /// 调用者的 proto_flag（PF_VAHID / PF_VATAB）— 用于 debug.getlocal level > 1
+    #[inline]
+    pub fn proto_flag(&self, call_stack: &[crate::objects::CallFrame<'a>]) -> u8 {
+        match self {
+            Self::Lua { frame_idx, .. } => call_stack
+                .get(*frame_idx as usize)
+                .map_or(0, |f| f.proto_flag),
+            Self::Full(f) => f.proto_flag,
+        }
+    }
+
+    /// 调用者的 nextraargs — 用于 debug.getlocal level > 1 的 vararg 访问
+    #[inline]
+    pub fn nextraargs(&self, call_stack: &[crate::objects::CallFrame<'a>]) -> i32 {
+        match self {
+            Self::Lua { frame_idx, .. } => call_stack
+                .get(*frame_idx as usize)
+                .map_or(0, |f| f.nextraargs),
+            Self::Full(f) => f.nextraargs,
+        }
+    }
+
+    /// 条目自身的函数闭包（entry.closure 语义）。
+    ///
+    /// - Lua 帧条目: 被调闭包 = `stack[call_stack[frame_idx].func]`（帧存活期有效，
+    ///   尾调用复用帧后自动变为尾调闭包 —— 与旧代码 `entry.closure = Some(closure)`
+    ///   的更新语义一致）；
+    /// - 合成条目: `is_c == true` 时恒 None（旧 `get_closure_from_stack` 对 C 条目
+    ///   直接返回 None —— 若回退 `stack[f.func]`，pcall/BuiltinFn 条目的 func 槽
+    ///   恰好是被调函数移入的槽（luaB_pcall 语义），会把被调闭包误当成条目闭包，
+    ///   导致 pcall 的 already_has_entry 误判跳过 push）；
+    ///   `is_c == false` 时优先显式 `closure` 字段，None 时回退 `stack[f.func]`
+    ///   （元方法条目 closure=None，回退读到调用者闭包 —— 与旧 get_closure_for_ci 一致）。
+    pub fn closure<'b>(
+        &'b self,
+        stack: &'b [TValue<'a>],
+        call_stack: &'b [crate::objects::CallFrame<'a>],
+    ) -> Option<&'b MyRc<LClosure<'a>, SlotAlloc>> {
+        match self {
+            Self::Lua { frame_idx, .. } => call_stack
+                .get(*frame_idx as usize)
+                .and_then(|f| stack.get(f.func))
+                .and_then(|v| match v {
+                    TValue::LClosure(c) => Some(c),
+                    _ => None,
+                }),
+            Self::Full(f) => {
+                if f.is_c {
+                    return None;
+                }
+                f.closure.as_ref().or_else(|| {
+                    stack.get(f.func).and_then(|v| match v {
+                        TValue::LClosure(c) => Some(c),
+                        _ => None,
+                    })
+                })
+            }
+        }
+    }
+}
+
+/// 把枚举条目物化为自包含 [`FullCallInfo`]（切片版，供无 LuaState 上下文的场合）。
+///
+/// Lua 帧条目的字段派生对应表（op_call push 时的写入关系）：
+/// - `base` = `frame.base`（调用者基址）
+/// - `func` = `frame.base - 1`（调用者函数槽）
+/// - `saved_pc` = `frame.return_pc - 1`（CALL 指令偏移）
+/// - `proto_flag` / `nextraargs` = `frame` 同名字段（调用者的）
+/// - `closure` = `stack[frame.func]`（被调闭包；尾调用复用帧后为尾调闭包）
+/// - `is_c` = false，`name` = None，`namewhat` = ""
+pub fn materialize_entry_slices<'a>(
+    stack: &[TValue<'a>],
+    call_stack: &[crate::objects::CallFrame<'a>],
+    entry: &CallInfoEntry<'a>,
+) -> FullCallInfo<'a> {
+    match entry {
+        CallInfoEntry::Full(f) => (**f).clone(),
+        CallInfoEntry::Lua {
+            frame_idx,
+            is_tailcall,
+        } => match call_stack.get(*frame_idx as usize) {
+            Some(f) => FullCallInfo {
+                is_c: false,
+                is_tailcall: *is_tailcall,
+                closure: stack.get(f.func).and_then(|v| match v {
+                    TValue::LClosure(c) => Some(c.clone()),
+                    _ => None,
+                }),
+                base: f.base,
+                func: f.base.saturating_sub(1),
+                saved_pc: f.return_pc.saturating_sub(1),
+                name: None,
+                namewhat: "",
+                proto_flag: f.proto_flag,
+                nextraargs: f.nextraargs,
+            },
+            // 防御: 帧索引失效（条目与帧生命周期失配，不应发生）——返回空条目
+            None => FullCallInfo {
+                is_c: false,
+                is_tailcall: *is_tailcall,
+                closure: None,
+                base: 0,
+                func: 0,
+                saved_pc: 0,
+                name: None,
+                namewhat: "",
+                proto_flag: 0,
+                nextraargs: 0,
+            },
+        },
+    }
+}
+
+/// 从栈切片延迟计算「调用者函数槽」的 closure 引用 — 核心逻辑
+///
+/// 对于非 C 条目: closure = stack[entry.func] (若为 LClosure) —— 即调用者槽
+/// 对于 C 函数条目: 返回 None
 /// 对于 base=0 或 stack 越界: 返回 None
-///
-/// perf: 替代 CallInfoEntry.closure 字段, 避免 op_call 中 Rc::clone
 pub fn get_closure_from_stack<'a, 'b>(
     stack: &'b [TValue<'a>],
+    call_stack: &'b [crate::objects::CallFrame<'a>],
     entry: &CallInfoEntry<'a>,
 ) -> Option<&'b MyRc<LClosure<'a>, SlotAlloc>> {
-    if entry.is_c {
+    if entry.is_c() {
         return None;
     }
-    if entry.base > 0 && entry.base <= stack.len() {
-        if let TValue::LClosure(c) = &stack[entry.func] {
+    let base = entry.base(call_stack);
+    if base > 0 && base <= stack.len() {
+        let slot = entry.func(call_stack);
+        if let TValue::LClosure(c) = &stack[slot] {
             return Some(c);
         }
     }
@@ -3168,17 +3494,14 @@ pub fn get_closure_from_stack<'a, 'b>(
 
 /// 从 CallInfoEntry 延迟计算 closure 引用 — 避免 op_call 热路径中 Rc::clone
 ///
-/// 优先返回 entry.closure (若已设置, 如 hook/metamethod 路径);
-/// 否则从 state.exec.stack[entry.func] 延迟计算 (op_call 快速路径)
+/// 优先返回条目自身的被调闭包 (hook/metamethod 显式设置; op_call 经帧派生);
+/// 详细回退语义见 [`CallInfoEntry::closure`]
 pub fn get_closure_for_ci<'a, 'b>(
     state: &'b LuaState<'a>,
     ci_idx: usize,
 ) -> Option<&'b MyRc<LClosure<'a>, SlotAlloc>> {
-    let entry = &state.call_info[ci_idx];
-    if entry.closure.is_some() {
-        return entry.closure.as_ref();
-    }
-    get_closure_from_stack(&state.stack, entry)
+    let entry = state.call_info.get(ci_idx)?;
+    entry.closure(&state.stack, &state.call_stack)
 }
 
 /// 从栈切片延迟计算 caller_proto 引用 — 核心逻辑
@@ -3188,13 +3511,16 @@ pub fn get_closure_for_ci<'a, 'b>(
 /// 对于 base=0 或 stack 越界: 返回 None
 pub fn get_caller_proto_from_stack<'a, 'b>(
     stack: &'b [TValue<'a>],
+    call_stack: &'b [crate::objects::CallFrame<'a>],
     entry: &CallInfoEntry<'a>,
 ) -> Option<&'b Rc<Proto<'a>>> {
-    if entry.is_c {
+    if entry.is_c() {
         return None;
     }
-    if entry.base > 0 && entry.base <= stack.len() {
-        if let TValue::LClosure(c) = &stack[entry.func] {
+    let base = entry.base(call_stack);
+    if base > 0 && base <= stack.len() {
+        let slot = entry.func(call_stack);
+        if let TValue::LClosure(c) = &stack[slot] {
             return Some(&c.proto);
         }
     }
@@ -3203,16 +3529,14 @@ pub fn get_caller_proto_from_stack<'a, 'b>(
 
 /// 从 CallInfoEntry 延迟计算 caller_proto 引用 — 避免在 op_call 热路径中 Rc::clone
 ///
-/// 对于 Lua 函数帧: caller_proto = state.exec.stack[entry.func].proto (若为 LClosure)
+/// 对于 Lua 函数帧: caller_proto = state.stack[entry.func].proto (若为 LClosure)
 /// 对于 C 函数帧: 返回 None (由 get_caller_proto_for_ci 处理 C 帧的特殊路径)
 /// 对于 base=0 或 stack 越界: 返回 None
-///
-/// perf: op_call 中移除 1 次 Rc::clone (atomic inc) + CallInfoEntry drop 时 1 次 Rc dec
 pub fn get_caller_proto_ref<'a, 'b>(
     state: &'b LuaState<'a>,
     entry: &CallInfoEntry<'a>,
 ) -> Option<&'b Rc<Proto<'a>>> {
-    get_caller_proto_from_stack(&state.stack, entry)
+    get_caller_proto_from_stack(&state.stack, &state.call_stack, entry)
 }
 
 /// 从 call_info 索引延迟计算 caller_proto 引用 (用于 lua_getinfo / traceback)
@@ -3227,12 +3551,12 @@ pub fn get_caller_proto_for_ci<'a, 'b>(
     state: &'a LuaState<'b>,
     ci_idx: usize,
 ) -> Option<&'a Rc<Proto<'b>>> {
-    let entry = &state.call_info[ci_idx];
-    if !entry.is_c {
+    let entry = state.call_info.get(ci_idx)?;
+    if !entry.is_c() {
         return get_caller_proto_ref(state, entry);
     }
     // C frame: 仅 call_c_function (name=None) 需要 caller_proto 用于 lua_getinfo('n')
-    if entry.name.is_some() {
+    if entry.name().is_some() {
         return None;
     }
     if ci_idx > 0 {

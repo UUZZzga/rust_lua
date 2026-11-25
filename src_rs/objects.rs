@@ -1520,10 +1520,15 @@ impl<'a> UpVal<'a> {
 ///
 /// 通过 `Deref<Target=[UpValRef]>` 暴露切片 API，调用点（`.len()` / `.iter()` /
 /// `[idx]` / `.is_empty()`）无需改动。
+/// UpValVec 内联容量 —— perf: 4→3 使 `RefCell<UpValVec>` 从 56B 降到 48B、
+/// `LClosure` payload 72→64B（MyRc 块 88→80B，LFH bucket 96→80）。
+/// 3 个以内上值（含最常见的 0/1/2）仍零额外分配；更多走堆缓冲。
+const UPVALVEC_INLINE: usize = 3;
+
 #[derive(Debug)]
 pub struct UpValVec<'a> {
     len: u8,
-    inline: [std::mem::MaybeUninit<UpValRef<'a>>; 4],
+    inline: [std::mem::MaybeUninit<UpValRef<'a>>; UPVALVEC_INLINE],
     /// perf: 替代 `Option<Vec<UpValRef>>`(24B) — 堆缓冲指针（null = 内联存储）。
     /// 已初始化元素数恒等于 `len`（迁移/扩容均由本类型手动管理），容量见 `heap_cap`。
     heap_ptr: *mut UpValRef<'a>,
@@ -1551,7 +1556,7 @@ impl<'a> UpValVec<'a> {
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
-        if capacity <= 4 {
+        if capacity <= UPVALVEC_INLINE {
             UpValVec::new()
         } else {
             let mut v = UpValVec::new();
@@ -1562,10 +1567,10 @@ impl<'a> UpValVec<'a> {
 
     /// 分配容量为 `cap` 的堆缓冲（保留既有内容）。
     ///
-    /// SAFETY（调用方约定）: `cap > 4`；扩容路径要求调用前 `heap_ptr` 非空
+    /// SAFETY（调用方约定）: `cap > UPVALVEC_INLINE`；扩容路径要求调用前 `heap_ptr` 非空
     /// 或 `len == 0`（本类型只在迁移/`with_capacity` 时调用，满足约定）。
     fn grow_heap(&mut self, cap: usize) {
-        debug_assert!(cap > 4 && cap <= u32::MAX as usize);
+        debug_assert!(cap > UPVALVEC_INLINE && cap <= u32::MAX as usize);
         let layout =
             std::alloc::Layout::array::<UpValRef<'a>>(cap).expect("UpValVec heap layout overflow");
         let new_ptr = unsafe { std::alloc::alloc(layout) } as *mut UpValRef<'a>;
@@ -1612,9 +1617,9 @@ impl<'a> UpValVec<'a> {
     }
 
     pub fn push_ref(&mut self, val: UpValRef<'a>) {
-        if self.heap_ptr.is_null() && self.len as usize >= 4 {
+        if self.heap_ptr.is_null() && self.len as usize >= UPVALVEC_INLINE {
             // 内联已满: 迁移到堆
-            self.grow_heap(8);
+            self.grow_heap(UPVALVEC_INLINE * 2);
             // SAFETY: 迁移后 len-1 位置的旧槽不再使用（len 计入堆侧）
             self.len += 1;
             unsafe {
@@ -1676,7 +1681,7 @@ impl<'a> Default for UpValVec<'a> {
 
 impl<'a> From<Vec<UpValRef<'a>>> for UpValVec<'a> {
     fn from(v: Vec<UpValRef<'a>>) -> Self {
-        if v.len() <= 4 {
+        if v.len() <= UPVALVEC_INLINE {
             let mut u = UpValVec::new();
             for x in v {
                 u.push_ref(x);
@@ -2161,7 +2166,29 @@ pub struct CallFrame<'a> {
     /// 调用者闭包句柄（C 的 `ci_func(ci)` 指针）。
     /// 返回时写回 `state.closure`，恢复调用者的 GETUPVAL/SETUPVAL 上下文。
     pub caller_closure: Option<MyRc<LClosure<'a>, SlotAlloc>>,
-    pub tbc_list: Option<usize>,
+    /// 调用者的 tbc_list 快照（`state.tbc_list`）— perf: `Option<usize>`(16B) → u32(4B)，
+    /// `u32::MAX` 表示 None。CallFrame 80→72B，每次调用少拷 8B。
+    pub tbc_list: u32,
+}
+
+/// `CallFrame::tbc_list` 的空值哨兵（对应 `None`）。
+pub const NO_TBC: u32 = u32::MAX;
+
+#[inline]
+pub fn tbc_to_u32(v: Option<usize>) -> u32 {
+    match v {
+        Some(i) => i as u32,
+        None => NO_TBC,
+    }
+}
+
+#[inline]
+pub fn tbc_from_u32(v: u32) -> Option<usize> {
+    if v == NO_TBC {
+        None
+    } else {
+        Some(v as usize)
+    }
 }
 
 /// 协程挂起时保存的 VM 执行上下文

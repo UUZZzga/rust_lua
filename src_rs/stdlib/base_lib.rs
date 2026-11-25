@@ -526,6 +526,13 @@ pub(crate) fn call_pcall<'a>(
         return Err(VmError::Yield(yield_values));
     }
 
+    // 错误已被本层 pcall 完整处理（将返回 false+msg 给 Lua 调用者）。
+    // 清除错误快照，防止残留污染下一次错误 —— xpcall 例外：call_xpcall 在
+    // state.pcall 返回后才 take 此快照供 message handler 使用（快照已移走，无残留）。
+    if status != 0 {
+        state.last_error_call_info = None;
+    }
+
     // pcall 后: 栈截断到 a, 结果在 a..
     let nret = state.top.saturating_sub(a);
 
@@ -647,7 +654,7 @@ fn lua_l_where<'a>(state: &LuaState<'a>, level: usize) -> String {
         // 对应 C 的 lua_getstack(L, 1): 跳过当前帧 (L->ci), 返回 L->ci->previous
         // Rust 版本中, call_info 最后一个元素是当前 C 函数帧 (如果在 C 函数中)
         if let Some(last_frame) = state.call_info.last() {
-            if last_frame.is_c {
+            if last_frame.is_c() {
                 // 当前在 C 函数中 (如 error/assert)
                 // 调用该 C 函数的帧可能是:
                 // 1. call_info[len-2] (如果是 C 函数帧) — 如 pcall -> assert
@@ -656,7 +663,7 @@ fn lua_l_where<'a>(state: &LuaState<'a>, level: usize) -> String {
                 let ci_len = state.call_info.len();
                 if ci_len >= 2 {
                     let prev_frame = &state.call_info[ci_len - 2];
-                    if prev_frame.is_c {
+                    if prev_frame.is_c() {
                         // 调用者也是 C 函数 (如 pcall -> assert), 返回空字符串
                         return String::new();
                     }
