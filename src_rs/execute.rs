@@ -163,10 +163,14 @@ pub enum VmResult<'a> {
 /// 函数体内无 resize/reserve/truncate — 快速臂成立。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CallOutcome {
-    /// 帧已切换或栈状态未知 (LClosure/impure/generic/tailcall/错误): 重载缓存
+    /// 帧已切换或栈状态未知 (impure/generic/tailcall/错误): 走 `'outer` 通用重载
     Reload,
     /// pure BuiltinFn 成功: 帧不变, state.pc 已由 call_pure_builtin +1
     Fast,
+    /// 新 Lua 帧已建立且**状态完全可知**: (帧上界, 是否变参帧)。
+    /// CALL 臂据此就地重载循环局部缓存, 免去 `'outer` 的帧上界重算 /
+    /// VARARGPREP 探测 / 回边 (对应 C 的 `luaD_precall` 返回后零额外操作)。
+    InPlace(usize, bool),
 }
 /// 指令错误处理的后续动作 — execute_loop 主循环与冷函数 handle_instruction_error
 /// 之间的控制流协议。
@@ -1374,9 +1378,8 @@ impl VmExecutor {
             // FORPREP/冷分发/错误恢复。base 同步刷新 (见上方 base 寄存器化注释)。
             macro_rules! reload_istream {
                 ($st:expr) => {
-                    // 帧切换点: 刷新「最内层 Lua 帧上界」(C 帧保持原值, 见
-                    // LuaState::recompute_lua_frame_ceiling)
-                    $st.recompute_lua_frame_ceiling();
+                    // perf: 帧上界由紧随其后的 `continue 'outer` 循环头统一刷新
+                    // (reload_istream! 的唯一调用点后必然重入 outer 循环), 此处不再重复计算。
                     #[cfg(feature = "fast_unsafe")]
                     {
                         code_base = $st.code.as_ptr();
@@ -1966,6 +1969,18 @@ impl VmExecutor {
                                 sync_top!(state);
                                 Ok(Next::Continue)
                             }
+                            Ok(CallOutcome::InPlace(ceiling, vararg)) => {
+                                // 新 Lua 帧状态完全已知 (op_call_lclosure 已建立帧):
+                                // 上界 = caller 给出的 ci.top; 变参帧的 live top 停在
+                                // 实参末尾等 OP_VARARGPREP 消费 (对应 `'outer` 的
+                                // VARARGPREP 判定), 非变参帧抬到帧上界。
+                                state.lua_frame_ceiling = ceiling;
+                                if !vararg {
+                                    state.sync_live_top();
+                                }
+                                reload_istream!(state);
+                                Ok(Next::Continue)
+                            }
                             Ok(CallOutcome::Reload) => {
                                 // 调用收尾的 live-top 抬升统一交给 `'outer` 循环入口:
                                 // 那里先 `recompute_lua_frame_ceiling()`（换回**当前**帧的
@@ -1994,10 +2009,8 @@ impl VmExecutor {
                         match r {
                             Ok(Some(vr)) => return Ok(vr),
                             Ok(None) => {
-                                // 帧切换收尾 (close continuation / pcall 恢复继续): live top
-                                // 已被 op_return* 复位为调用者帧上界或产出末尾, 抬回边界
-                                // (见 LuaState::sync_live_top)
-                                state.sync_live_top();
+                                // perf: 帧上界重算 + live top 抬升统一由循环头完成
+                                // (recompute → sync_live_top → sync_top), 此处直接重入
                                 continue 'outer;
                             }
                             Err(VmError::Yield(values)) => return Ok(VmResult::Yield { values }),
@@ -2012,10 +2025,8 @@ impl VmExecutor {
                         match r {
                             Ok(Some(vr)) => return Ok(vr),
                             Ok(None) => {
-                                // 帧切换收尾 (close continuation / pcall 恢复继续): live top
-                                // 已被 op_return* 复位为调用者帧上界或产出末尾, 抬回边界
-                                // (见 LuaState::sync_live_top)
-                                state.sync_live_top();
+                                // perf: 帧上界重算 + live top 抬升统一由循环头完成
+                                // (recompute → sync_live_top → sync_top), 此处直接重入
                                 continue 'outer;
                             }
                             Err(VmError::Yield(values)) => return Ok(VmResult::Yield { values }),
@@ -2029,10 +2040,8 @@ impl VmExecutor {
                         match r {
                             Ok(Some(vr)) => return Ok(vr),
                             Ok(None) => {
-                                // 帧切换收尾 (close continuation / pcall 恢复继续): live top
-                                // 已被 op_return* 复位为调用者帧上界或产出末尾, 抬回边界
-                                // (见 LuaState::sync_live_top)
-                                state.sync_live_top();
+                                // perf: 帧上界重算 + live top 抬升统一由循环头完成
+                                // (recompute → sync_live_top → sync_top), 此处直接重入
                                 continue 'outer;
                             }
                             Err(VmError::Yield(values)) => return Ok(VmResult::Yield { values }),
@@ -2099,6 +2108,50 @@ impl VmExecutor {
                         trap = state.hook_mask;
                         r
                     }),
+                    // === 闭包创建/关闭: 常态不切帧, 留在热循环 ===
+                    // perf: 原先走冷分发 + 整轮 'outer 重入 (重算帧上界/top 抬升/
+                    // 指令流缓存)。这里只做必要刷新: 分配/关闭可能触发 GC finalizer,
+                    // 嵌套 VM 可能扩容并移动栈 Vec —— 仅重取栈基址与 top 缓存;
+                    // code/base/closure 均不变 (嵌套 VM 正常返回时会恢复)。
+                    OpCode::CLOSURE => try_inst!({
+                        state.pc = cur_pc!();
+                        let r = Self::op_closure(base, state, inst);
+                        #[cfg(feature = "fast_unsafe")]
+                        {
+                            stack_base = unsafe { state.stack.as_mut_ptr().add(base) };
+                        }
+                        // GC finalizer (__gc 元方法) 可经嵌套 VM 在收尾处把 live top
+                        // 压到结果末尾 —— 抬回指令边界上界 (与旧冷分发臂语义一致)。
+                        state.sync_live_top();
+                        sync_top!(state);
+                        trap = state.hook_mask;
+                        r.map(|_| Next::Continue)
+                    }),
+                    // OP_CLOSE 仅当存在 to-be-closed 变量时才可能执行 __close 元方法
+                    // (会切帧/迁移 pc) —— 该情形回退冷分发 + 循环头重载。
+                    OpCode::CLOSE => try_inst!({
+                        if state.tbc_list.is_none() {
+                            state.pc = cur_pc!();
+                            let r = Self::op_close(base, state, inst);
+                            #[cfg(feature = "fast_unsafe")]
+                            {
+                                stack_base = unsafe { state.stack.as_mut_ptr().add(base) };
+                            }
+                            // 同 CLOSURE: 无 TBC 时可能触发 GC finalizer, 抬回边界
+                            state.sync_live_top();
+                            sync_top!(state);
+                            trap = state.hook_mask;
+                            r.map(|_| Next::Continue)
+                        } else {
+                            state.pc = cur_pc!();
+                            let r = Self::dispatch_cold_opcodes(base, state, op, inst);
+                            if r.is_ok() {
+                                // TBC 慢路径: __close 可能切帧, 交给循环头完整重载
+                                continue 'outer;
+                            }
+                            r.map(|_| Next::Continue)
+                        }
+                    }),
                     OpCode::LOADKX
                     | OpCode::SETUPVAL
                     | OpCode::NEWTABLE
@@ -2117,13 +2170,11 @@ impl VmExecutor {
                     | OpCode::BNOT
                     | OpCode::LEN
                     | OpCode::CONCAT
-                    | OpCode::CLOSE
                     | OpCode::TBC
                     | OpCode::TFORPREP
                     | OpCode::TFORCALL
                     | OpCode::TFORLOOP
                     | OpCode::SETLIST
-                    | OpCode::CLOSURE
                     | OpCode::GETVARG
                     | OpCode::ERRNNIL
                     | OpCode::EXTRAARG => try_inst!({
@@ -2132,10 +2183,12 @@ impl VmExecutor {
                         // 帧切换/冷分发后统一重载指令流 (pc/pc_ptr 与 code 同步)
                         reload_istream!(state);
                         if r.is_ok() && !next_is_varargprep_at!(pc) {
-                            // 冷门 opcode 收尾: OP_CONCAT / OP_TFORCALL / OP_SETLIST / OP_CLOSE
-                            // 等都可能把 live top 压到结果末尾或只写 mret_end; 抬回边界
-                            // (见 LuaState::sync_live_top)。例外: 帧入口 (TFORCALL 的 Lua
-                            // 迭代器) 把 top 压成实参末尾等 OP_VARARGPREP 消费时不抬。
+                            // 冷门 opcode 收尾: OP_CONCAT / OP_TFORCALL / OP_SETLIST /
+                            // OP_CLOSE 等都可能把 live top 压到结果末尾或只写 mret_end;
+                            // 抬回边界 (见 LuaState::sync_live_top)。例外: 帧入口 (TFORCALL
+                            // 的 Lua 迭代器) 把 top 压成实参末尾等 OP_VARARGPREP 消费时不抬。
+                            // 注意: 成功路径经 `Next::Continue` 留在内层循环, 不会经过
+                            // 'outer 循环头的统一抬升 —— 此处必须自己完成。
                             state.sync_live_top();
                             // 抬升发生在 reload_istream! 之后 —— top 缓存按抬升后的
                             // 值重取 (否则 frame 入口的实参末尾会低报)
@@ -6641,7 +6694,10 @@ impl VmExecutor {
         match func_at_a {
             TValue::LClosure(closure) => {
                 let closure = closure.clone();
-                Self::op_call_lclosure(state, a, b, c, closure).map(|_| CallOutcome::Reload)
+                Self::op_call_lclosure(state, a, b, c, closure).map(|known| match known {
+                    Some((ceiling, vararg)) => CallOutcome::InPlace(ceiling, vararg),
+                    None => CallOutcome::Reload,
+                })
             }
             TValue::BuiltinFn(bf) if state.hook_mask & 3 == 0 && bf.is_pure() => {
                 let bf = *bf; // Copy — 借用结束
@@ -6757,6 +6813,8 @@ impl VmExecutor {
 
     /// op_call 的 LClosure 路径 — Lua 函数调用帧建立。
     /// 从 op_call 快速路径进入 (closure 已从栈提取, Rc 已 +1)。
+    /// 注: 保持 inline(never) —— 实测内联进巨型主循环后基准反而变慢
+    /// (代码体积/i-cache 压力), 见 bench 对比。
     #[inline(never)]
     fn op_call_lclosure<'a>(
         state: &mut LuaState<'a>,
@@ -6764,7 +6822,7 @@ impl VmExecutor {
         b: usize,
         c: i32,
         closure: MyRc<LClosure<'a>, SlotAlloc>,
-    ) -> Result<(), VmError<'a>> {
+    ) -> Result<Option<(usize, bool)>, VmError<'a>> {
         let nargs = if b == 0 {
             // perf: 用 state.top 而非 state.stack.len() — smart_clear_stack 不截断 Vec
             state.mret_payload_end(a).saturating_sub(a + 1)
@@ -6888,7 +6946,14 @@ impl VmExecutor {
         }
         // 补齐帧寄存器 scratch: 帧函数槽处已是被调闭包 (有 ci 时 ci.func, 入口帧 base - 1)
         state.pad_frame_scratch();
-        Ok(())
+        // 非变参帧: 帧上界 = a + 1 + fsize, live top 也已精确等于它 (除 hook 回调
+        // 可能改动嵌套 VM 状态外, 状态完全可知) → 交 CALL 臂就地重载缓存。
+        let frame_end = a + 1 + fsize;
+        if !proto_is_vararg && state.hook_mask & 1 != 0 {
+            Ok(None)
+        } else {
+            Ok(Some((frame_end, proto_is_vararg)))
+        }
     }
 
     /// op_call 慢路径 — Table/__call/impure BuiltinFn/RustClosure/LCFn/CClosure/错误。
@@ -7949,7 +8014,6 @@ impl VmExecutor {
             state.constants = frame.constants;
             state.protos = frame.protos;
             state.base = frame.base;
-            state.recompute_lua_frame_ceiling();
             state.pad_frame_scratch();
             state.pc = frame.return_pc;
             state.num_params = frame.num_params;
@@ -8083,7 +8147,6 @@ impl VmExecutor {
             state.constants = frame.constants;
             state.protos = frame.protos;
             state.base = frame.base;
-            state.recompute_lua_frame_ceiling();
             state.pad_frame_scratch();
             state.pc = frame.return_pc;
             state.num_params = frame.num_params;
@@ -8173,8 +8236,10 @@ impl VmExecutor {
         // perf: 快速路径 — 无 open upvalue 时跳过 close() 函数调用开销
         Self::close_or_skip(state)?;
         // pcall 保护函数返回检查 (在 call_stack.pop() 之前)
-        // 注意: val 已被 take，需要先放回栈，让 try_finish_pcall_return 能读到
-        if a < state.top {
+        // 注意: val 已被 take，需要先放回栈，让 try_finish_pcall_return 能读到。
+        // perf: 仅存在 pcall 保护帧时才需要写回 —— 否则这次 clone+写栈纯属浪费
+        // (返回值紧接着由 op_return1_finish 写入 return_base)。
+        if !state.pcall_protection_stack.is_empty() && a < state.top {
             state.stack[a] = val.clone();
         }
         if Self::try_finish_pcall_return(state, 1, a)? {
@@ -8209,7 +8274,6 @@ impl VmExecutor {
             state.constants = frame.constants;
             state.protos = frame.protos;
             state.base = frame.base;
-            state.recompute_lua_frame_ceiling();
             state.pad_frame_scratch();
             state.pc = frame.return_pc;
             state.num_params = frame.num_params;

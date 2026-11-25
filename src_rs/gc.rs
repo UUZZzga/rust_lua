@@ -128,12 +128,15 @@ pub enum GCMode {
 
 #[derive(Debug, Clone)]
 pub(crate) struct GCObjectMeta<'a> {
+    /// 16 字节 (判别式 + 弱引用指针) — 放在首位使 `size`/标志位落进尾部对齐空隙,
+    /// 整个条目 24 字节 (原 32)。GC 表按对象数增长, 每对象省 8 字节。
+    pub weak_value: WeakValue<'a>,
+    /// 计费大小 (字节)。u32 足够: 单个 Lua 对象不可能超过 4GB。
+    pub size: u32,
     pub color: GCColor,
     pub age: GCAge,
-    pub weak_value: WeakValue<'a>,
     #[allow(dead_code)]
     pub finalized: bool,
-    pub size: usize,
     #[allow(dead_code)]
     pub traversed: bool,
 }
@@ -141,11 +144,11 @@ pub(crate) struct GCObjectMeta<'a> {
 impl<'a> GCObjectMeta<'a> {
     fn new(size: usize) -> Self {
         GCObjectMeta {
+            weak_value: WeakValue::Nil(NilKind::Strict),
+            size: size.min(u32::MAX as usize) as u32,
             color: GCColor::White0,
             age: GCAge::New,
-            weak_value: WeakValue::Nil(NilKind::Strict),
             finalized: false,
-            size,
             traversed: false,
         }
     }
@@ -517,9 +520,11 @@ pub(crate) fn is_marked<'a>(val: &TValue<'a>, gc: &GCState) -> bool {
 struct GcObjects<'a> {
     metas: Vec<Option<GCObjectMeta<'a>>>,
     free_ids: Vec<u32>,
-    /// 活跃对象 ID 列表 — sweep 时只遍历此列表而非整个 metas 数组。
-    /// register_object 时 push，sweep_unreachable 时重建（只保留可达对象）。
-    all_objects: Vec<u32>,
+    /// 活跃对象计数（metas 中为 `Some` 的槽位数）。
+    /// 取代旧的 `all_objects: Vec<u32>`：ID 即 metas 下标且空闲槽位会被复用，
+    /// 故 metas 长度天然以「峰值活跃数」为上界，遍历时跳过 `None` 即可 ——
+    /// 每个对象的登记因此少一次 Vec push，sweep 也无需再整体重写一遍活跃表。
+    active: usize,
 }
 
 pub struct GCState<'a> {
@@ -580,8 +585,8 @@ impl<'a> GCState<'a> {
             next_id: Cell::new(1),
             objects: RefCell::new(GcObjects {
                 metas: Vec::with_capacity(1024),
-                all_objects: Vec::with_capacity(1024),
                 free_ids: Vec::with_capacity(256),
+                active: 0,
             }),
             gray: RefCell::new(VecDeque::with_capacity(256)),
             gray_again: RefCell::new(VecDeque::with_capacity(64)),
@@ -686,11 +691,6 @@ impl<'a> GCState<'a> {
                 return Err(meta.weak_value);
             }
         }
-        if objs.all_objects.len() + 1 > objs.all_objects.capacity() {
-            if objs.all_objects.try_reserve(1).is_err() {
-                return Err(meta.weak_value);
-            }
-        }
 
         // 优先重用已释放的 ID 槽位，避免 metas 数组无限增长。
         // 新 ID 路径：ID 单调递增、metas 与 next_id 同步增长 → 稠密，无需 while
@@ -713,7 +713,7 @@ impl<'a> GCState<'a> {
                 GCObjectId(id_val)
             }
         };
-        objs.all_objects.push(id.0);
+        objs.active += 1;
 
         let current = self.gc_debt.get();
         let charged = size.max(32) as isize;
@@ -788,9 +788,9 @@ impl<'a> GCState<'a> {
         }
     }
 
-    /// 返回实际存活（非 None）的对象数 — O(1) 直接读 all_objects 长度
+    /// 返回实际存活（非 None）的对象数 — O(1) 直接读计数器
     pub fn active_count(&self) -> usize {
-        self.objects.borrow().all_objects.len()
+        self.objects.borrow().active
     }
 
     /// 返回当前 GC 触发阈值
@@ -878,19 +878,17 @@ impl<'a> GCState<'a> {
         let mut objs = self.objects.borrow_mut();
         let mut total_freed_size = 0usize;
 
-        let mut write = 0usize;
-        for read in 0..objs.all_objects.len() {
-            let id = objs.all_objects[read];
-            let i = id as usize;
-
+        // 遍历 metas 本身（下标即 ID，空闲槽位为 None）—— 不再维护/重写活跃表。
+        // 0 号槽是 ID 起点占位，恒为 None。
+        for i in 1..objs.metas.len() {
             let is_dead = match objs.metas[i].as_ref() {
                 Some(m) => m.color.is_white(cw),
-                None => false,
+                None => continue,
             };
 
             if is_dead {
                 if let Some(ref meta) = objs.metas[i] {
-                    total_freed_size = total_freed_size.saturating_add(meta.size.max(32));
+                    total_freed_size = total_freed_size.saturating_add(meta.size.max(32) as usize);
                     match meta.weak_value {
                         WeakValue::Table(ref weak_table) => {
                             if let Some(upgrade) = weak_table.upgrade() {
@@ -926,19 +924,16 @@ impl<'a> GCState<'a> {
                     }
                 }
                 objs.metas[i] = None;
+                objs.active -= 1;
                 // 记录空闲槽位（可失败）：容量不足时放弃记录 —— 该槽位保持 None
                 // 且不可达，仅失去复用机会，不会泄漏用户内存，更不能因此 abort。
                 if objs.free_ids.len() + 1 <= objs.free_ids.capacity()
                     || objs.free_ids.try_reserve(1).is_ok()
                 {
-                    objs.free_ids.push(id);
+                    objs.free_ids.push(i as u32);
                 }
-            } else {
-                objs.all_objects[write] = id;
-                write += 1;
             }
         }
-        objs.all_objects.truncate(write);
         let estimate = self.gc_estimate.get();
         self.gc_estimate
             .set(estimate.saturating_sub(total_freed_size));
@@ -1108,12 +1103,8 @@ impl<'a> GCState<'a> {
         };
         {
             let mut objs = self.objects.borrow_mut();
-            let GcObjects {
-                metas, all_objects, ..
-            } = &mut *objs;
-            for &id in all_objects.iter() {
-                let i = id as usize;
-                if let Some(ref mut m) = metas[i] {
+            for m in objs.metas.iter_mut() {
+                if let Some(m) = m.as_mut() {
                     m.color = new_color;
                 }
             }
@@ -1217,9 +1208,9 @@ impl<'a> GCState<'a> {
         if let Some(mut meta) = self.meta_mut(id) {
             // 用 .max(32) 保持与 register_object/sweep_unreachable 一致的 charge 口径
             // 否则当 old < 32 时，register 收取 32 但此处只按 old 调整，导致 gc_estimate 虚高
-            let old_charged = meta.size.max(32);
+            let old_charged = meta.size.max(32) as usize;
             let new_charged = size.max(32);
-            meta.size = size;
+            meta.size = size.min(u32::MAX as usize) as u32;
             let estimate = self.gc_estimate.get();
             self.gc_estimate.set(estimate + new_charged - old_charged);
         }

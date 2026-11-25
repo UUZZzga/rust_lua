@@ -4702,17 +4702,12 @@ pub extern "C-unwind" fn lua_upvaluejoin(
 pub extern "C" fn luaL_alloc(
     _ud: *mut c_void,
     ptr: *mut c_void,
-    _osize: usize,
+    osize: usize,
     nsize: usize,
 ) -> *mut c_void {
-    if nsize == 0 {
-        if !ptr.is_null() {
-            unsafe { libc::free(ptr) };
-        }
-        ptr::null_mut()
-    } else {
-        unsafe { libc::realloc(ptr, nsize) }
-    }
+    // 与 C 的 `l_alloc`（lauxlib.c）完全一致: 直接 realloc/free, 不经任何缓存。
+    let _ = osize;
+    unsafe { crate::mem::raw_realloc(ptr as *mut u8, nsize) as *mut c_void }
 }
 
 /// skynet 修改版 luaL_loadfilex_ (lauxlib.c:821), 带 codecache 查询.

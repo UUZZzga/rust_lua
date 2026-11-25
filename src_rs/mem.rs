@@ -132,6 +132,33 @@ pub struct DefaultAllocator;
 /// 平台 malloc 的保证对齐（`max_align_t`）。超过此值回退 `std::alloc`。
 const MALLOC_MAX_ALIGN: usize = 16;
 
+// ============================================================================
+// 原始 C realloc 语义
+// ============================================================================
+//
+// 与 C Lua 的 `l_alloc`（lauxlib.c）逐点对齐: 直接 libc malloc/realloc/free,
+// **不做** 任何小对象缓存或尺寸分级池。GC 对象 (闭包/upvalue/短字符串) 的
+// 高频分配释放因此与 C 版承受同一份宿主堆成本 —— 性能差距只能靠 VM 架构
+// (帧模型/指令分发) 来消除, 而不是靠分配器旁路。
+
+/// C `realloc` 语义 (`new_size == 0` 释放, `ptr` 为 null 时等同 malloc)。
+///
+/// 供 [`DefaultAllocator`] 与 `luaL_alloc` 共用 —— 两条默认路径与 C 版
+/// `l_alloc` 完全一致, 不经过任何缓存层。
+///
+/// # Safety
+/// 与 `libc::realloc` 相同: `ptr` 必须来自本分配器或 `libc::malloc` 家族。
+pub unsafe fn raw_realloc(ptr: *mut u8, new_size: usize) -> *mut u8 {
+    if new_size == 0 {
+        if !ptr.is_null() {
+            libc::free(ptr.cast());
+        }
+        std::ptr::null_mut()
+    } else {
+        libc::realloc(ptr.cast(), new_size).cast()
+    }
+}
+
 /// 高对齐（> `max_align_t`）回退路径 —— 保留 std::alloc 的布局检查与对齐能力。
 fn std_alloc(ptr: *mut u8, old_size: usize, new_size: usize, align: usize) -> *mut u8 {
     if new_size == 0 {
@@ -158,24 +185,14 @@ fn std_alloc(ptr: *mut u8, old_size: usize, new_size: usize, align: usize) -> *m
 
 /// 默认对齐：1 字节，用于非类型化分配（C 的 realloc 语义）。
 impl Allocator for DefaultAllocator {
-    fn alloc(&self, ptr: *mut u8, _old_size: usize, new_size: usize, align: usize) -> *mut u8 {
+    fn alloc(&self, ptr: *mut u8, old_size: usize, new_size: usize, align: usize) -> *mut u8 {
         if align > MALLOC_MAX_ALIGN {
-            return std_alloc(ptr, _old_size, new_size, align);
+            return std_alloc(ptr, old_size, new_size, align);
         }
         // SAFETY: malloc/realloc/free 满足 C 的 realloc 语义（new_size==0 释放）。
         // 对齐 ≤ max_align_t 由平台 malloc 保证，与 C Lua 经 `l_alloc` 的行为一致。
-        unsafe {
-            if new_size == 0 {
-                if !ptr.is_null() {
-                    libc::free(ptr.cast());
-                }
-                std::ptr::null_mut()
-            } else if ptr.is_null() {
-                libc::malloc(new_size).cast()
-            } else {
-                libc::realloc(ptr.cast(), new_size).cast()
-            }
-        }
+        let _ = old_size;
+        unsafe { raw_realloc(ptr, new_size) }
     }
 
     #[inline]

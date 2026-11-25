@@ -1578,6 +1578,13 @@ impl<'a> LuaState<'a> {
                 // 下界同时取 frame_floor() 的保守上界 (base + MAX_FSTACK + 1),
                 // 使下文的 pad_frame_scratch / push / frame_need 检查都不再分配 ——
                 // 那些点位于保护边界之外, 一旦在那里抛内存错误就会跳过本帧。
+                // 嵌套 VM 会覆写这两个派生字段 (元方法/子函数帧切换时 recompute);
+                // 成功返回后必须随 saved_* 一起恢复, 否则调用者帧的上界/多返回值
+                // 末尾残留嵌套帧的值 (实测 debug 断言「边界 top 低于帧上界」)。
+                // 注意: 必须在本分支的 precall 写入 `lua_frame_ceiling` 之前捕获
+                // (下方 L1614 会把它覆写成被调函数的帧上界)。
+                let saved_ceiling = self.lua_frame_ceiling;
+                let saved_mret_end = self.mret_end;
                 let fsize = closure.proto.max_stack_size as usize;
                 // Lua 帧上界 (C 的 ci->top = func + 1 + p->maxstacksize) —— VARARGPREP
                 // 会在重排后自行更新。
@@ -2096,6 +2103,8 @@ impl<'a> LuaState<'a> {
                     self.nextraargs = saved_nextraargs;
                     self.closure = saved_closure;
                     self.tbc_list = saved_tbc_list;
+                    self.lua_frame_ceiling = saved_ceiling;
+                    self.mret_end = saved_mret_end;
                 }
 
                 match result {

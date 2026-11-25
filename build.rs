@@ -798,7 +798,11 @@ fn parse_symbols(
             if !line.contains("External") {
                 continue;
             }
-            let raw = line[bar + 1..].trim();
+            let raw_full = line[bar + 1..].trim();
+            // dumpbin 会给部分符号追加注解 (字符串常量等), 形如
+            //   "??_C@_01EANLCPLP@y@ (`string')"
+            // 符号名本身不含空白, 取第一个空白前的部分即可去掉注解。
+            let raw = raw_full.split_whitespace().next().unwrap_or("");
             // 跳过编译器内部符号 (@feat.00)、段符号 (.text/.rdata) 与导入桩 (__imp_*)。
             if raw.is_empty()
                 || raw.starts_with('.')
@@ -812,6 +816,11 @@ fn parse_symbols(
             } else {
                 raw
             };
+            // .def 的 EXPORTS 只接受 C 标识符: 滤掉 C++ 修饰名/字符串常量 (??_C@...)
+            // 等 —— 写进去会让链接器报 LNK1118 语法错误并中止整个 DLL 构建。
+            if !is_c_identifier(name) {
+                continue;
+            }
             if line.contains("UNDEF") {
                 undefined.insert(name.to_string());
             } else {
@@ -822,14 +831,17 @@ fn parse_symbols(
             let mut it = line.split_whitespace();
             match (it.next(), it.next(), it.next()) {
                 (Some("U"), Some(name), _) => {
-                    undefined.insert(name.to_string());
+                    if is_c_identifier(name) {
+                        undefined.insert(name.to_string());
+                    }
                 }
                 (Some(_addr), Some(kind), Some(name))
                     if kind.len() == 1
                         && kind.as_bytes()[0].is_ascii_uppercase()
                         && kind != "U"
                         && !name.starts_with('.')
-                        && !name.starts_with('_') =>
+                        && !name.starts_with('_')
+                        && is_c_identifier(name) =>
                 {
                     defined.insert(name.to_string());
                 }
@@ -902,11 +914,25 @@ fn write_def(path: &Path, library: Option<&str>, symbols: &[String]) -> Result<(
     }
     content.push_str("EXPORTS\n");
     for sym in symbols {
+        // 防御: 非 C 标识符写进 .def 会让链接器 LNK1118 直接失败。
+        if !is_c_identifier(sym) {
+            continue;
+        }
         content.push_str("  ");
         content.push_str(sym);
         content.push('\n');
     }
     fs::write(path, content).map_err(|e| format!("写入 {} 失败: {e}", path.display()))
+}
+
+/// 是否为可安全写入 .def `EXPORTS` 行的 C 标识符。
+fn is_c_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// 定位与编译器同目录的工具 (lib.exe / dumpbin.exe / nm / dlltool),
