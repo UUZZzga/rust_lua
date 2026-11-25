@@ -2016,6 +2016,24 @@ impl<'a> LuaState<'a> {
                 unsafe { worklist.push(raw_from_tvalue(val)) };
             }
         }
+        // 挂起期间被移出的「调用者栈」快照（coroutine 库 resume 时把自身栈整体
+        // 移入 caller_gc_stacks）。其中保存的局部值可能是更深层 coroutine.wrap
+        // 闭包 → 内层线程对象：漏扫会让内层线程被判不可达，clear_dead_threads
+        // 随即把**正在执行**的协程 context 换成默认值 → 执行态悬垂（实测
+        // big.lua 嵌套 wrap 场景 0xC0000005 / 已释放内存 0xFEEEFEEE）。
+        for stack in &exec.caller_gc_stacks {
+            for val in stack {
+                if needs_gc_mark(val) {
+                    unsafe { worklist.push(raw_from_tvalue(val)) };
+                }
+            }
+        }
+        // C 安全 keepalive 区（与 collect_roots_into 同口径）
+        for val in &exec.c_safety_keepalive {
+            if needs_gc_mark(val) {
+                unsafe { worklist.push(raw_from_tvalue(val)) };
+            }
+        }
         for val in exec.cur_proto().constants.iter() {
             if needs_gc_mark(val) {
                 unsafe { worklist.push(raw_from_tvalue(val)) };
