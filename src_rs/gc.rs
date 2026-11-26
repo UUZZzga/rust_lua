@@ -243,10 +243,10 @@ fn notify_gc_death_impl(header: &GCObjectHeader) {
 /// 挂到**该 GCState 自己的** `pending_deaths`，由 `drain_pending_deaths` 在
 /// 安全点排空（meta 保留 → sweep 兜底）。
 unsafe fn early_unregister(owner: *const u8, id32: u32) {
-    // 生命周期擦除：仅访问与 'a 无关的字段（objects / gc_estimate / pending_deaths）。
+    // 生命周期擦除：仅访问与 'a 无关的字段（objects / pending_death_bytes / pending_deaths）。
     let gc: &GCState<'static> = &*(owner as *const GCState<'static>);
     match gc.objects.try_borrow_mut() {
-        Ok(mut objs) => GCState::early_unregister_locked(&mut objs, id32, &gc.gc_estimate),
+        Ok(mut objs) => GCState::early_unregister_locked(&mut objs, id32, &gc.pending_death_bytes),
         Err(_) => {
             // pending_deaths 与 objects 是不同的 RefCell；两次借用都失败
             //（只可能发生在嵌套 drain 中）时丢弃 —— meta 保留，sweep 兜底。
@@ -644,6 +644,14 @@ pub struct GCState<'a> {
     bound_owner: Cell<*const u8>,
     /// objects 被借用期间挂起的死亡通知 id（本状态私有，替代原线程局部表）。
     pending_deaths: RefCell<Vec<u32>>,
+    /// 早释放对象的计费暂存 —— 死亡时**不**立即扣减 `gc_estimate`，而是累积到
+    /// 这里，等下一次回收点统一扣减。
+    ///
+    /// 与 C 的语义对齐：`collectgarbage"count"` 统计的是「已分配且尚未被回收的
+    /// 内存」，GC 停止期间垃圾也计入其中并单调增长（tests_lua/gc.lua 的 pace
+    /// 测试、stop/step 段都依赖这一点）。若在 strong 归零时立即扣减，内存虽被
+    /// 引用计数真实释放，但计数不再增长，上述测试会死循环。
+    pending_death_bytes: Cell<usize>,
     /// 紧急回收模式 —— 对应 C 的 `global_State.gcemergency`（lgc.c::luaC_fullgc
     /// 的 `isemergency` 参数）：内存分配失败后的回收必须**避免改变解释器状态**，
     /// 即不运行 finalizer（可能执行任意 Lua 代码并再次分配）、不缩栈。
@@ -701,6 +709,7 @@ impl<'a> GCState<'a> {
             gcemergency: Cell::new(false),
             bound_owner: Cell::new(std::ptr::null()),
             pending_deaths: RefCell::new(Vec::new()),
+            pending_death_bytes: Cell::new(0),
             threads: RefCell::new(Vec::new()),
         }
     }
@@ -732,11 +741,13 @@ impl<'a> GCState<'a> {
         }
     }
 
-    /// 清除一个已死对象的 meta（free_ids 复用 + 活跃计数 + 计费扣减）。
+    /// 清除一个已死对象的 meta（free_ids 复用 + 活跃计数 + 计费暂存）。
     ///
     /// 与 [`GCState::sweep_unreachable`] 的释放记账逐点一致：sweep 侧 subtract
-    /// `meta.size.max(32)`、push free_ids 带 try_reserve 守卫，此处同形。
-    fn early_unregister_locked(objs: &mut GcObjects<'_>, id32: u32, estimate: &Cell<usize>) {
+    /// `meta.size.max(32)`、push free_ids 带 try_reserve 守卫，此处同形。区别是
+    /// 计费**不在此扣减**，而是累加到 `pending_death_bytes`，由回收点统一扣减
+    ///（保持 GC 停止期间 `collectgarbage"count"` 单调增长，与 C 一致）。
+    fn early_unregister_locked(objs: &mut GcObjects<'_>, id32: u32, death_bytes: &Cell<usize>) {
         let id = id32 as usize;
         if id >= objs.metas.len() {
             return;
@@ -748,8 +759,7 @@ impl<'a> GCState<'a> {
             {
                 objs.free_ids.push(id as u32);
             }
-            let e = estimate.get();
-            estimate.set(e.saturating_sub(meta.size.max(32) as usize));
+            death_bytes.set(death_bytes.get().saturating_add(meta.size.max(32) as usize));
         }
     }
 
@@ -765,7 +775,7 @@ impl<'a> GCState<'a> {
             let id32 = list[i];
             match self.objects.try_borrow_mut() {
                 Ok(mut objs) => {
-                    Self::early_unregister_locked(&mut objs, id32, &self.gc_estimate);
+                    GCState::early_unregister_locked(&mut objs, id32, &self.pending_death_bytes);
                     list.swap_remove(i);
                 }
                 Err(_) => i += 1,
@@ -1812,6 +1822,17 @@ impl<'a> LuaState<'a> {
         unsafe { self.gc_mut().sweep_unreachable() };
         // sweep 借用期间挂起的死亡通知（clear_for_drop 连锁 drop 触发）就地排空
         unsafe { self.gc_mut().drain_pending_deaths() };
+
+        // 早释放对象的计费在**回收点**统一扣减（对应 C 中 sweep 才回收垃圾）。
+        // 死亡时只暂存字节数，保证 GC 停止/step 期间 `collectgarbage"count"`
+        // 随垃圾单调增长，与 C 语义一致（tests_lua/gc.lua 的 pace 测试依赖）。
+        unsafe {
+            let g = self.gc_mut();
+            let pend = g.pending_death_bytes.replace(0);
+            if pend != 0 {
+                g.gc_estimate.set(g.gc_estimate.get().saturating_sub(pend));
+            }
+        }
 
         // 字符串表清理
         let str_sweep_start = if gc_stats_enabled() {
