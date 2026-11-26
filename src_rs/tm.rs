@@ -389,6 +389,32 @@ impl std::error::Error for TagMethodError {}
 /// ```
 ///
 /// Rust 版本: 在栈顶压入函数和参数，调用 pcall，将结果写入 res 槽位。
+/// 压入元方法调用对应的 CallInfoEntry（namewhat = "metamethod"）。
+///
+/// 使用内联的 [`crate::state::CallInfoEntry::Meta`] 变体 —— 元方法调用是热路径
+/// （每次 `__index` / `__add` … 各压一条），用 `Full(Box<..>)` 会让每次调用
+/// 多一次 malloc/free；内联条目零分配且字段完全等价。
+#[inline]
+fn push_meta_call_entry<'a>(
+    state: &mut LuaState<'a>,
+    tm: TagMethod,
+    caller_base: usize,
+    caller_func: usize,
+    caller_pc: usize,
+    caller_proto_flag: u8,
+    caller_nextraargs: i32,
+    _also_snapshot: bool,
+) {
+    state.call_info.push(crate::state::CallInfoEntry::meta(
+        caller_base,
+        caller_func,
+        caller_pc,
+        tm.event_name(),
+        caller_proto_flag,
+        caller_nextraargs,
+    ));
+}
+
 pub(crate) fn call_tm_res<'a>(
     state: &mut LuaState<'a>,
     f: &TValue<'a>,
@@ -423,18 +449,28 @@ pub(crate) fn call_tm_res<'a>(
     let caller_nextraargs = state.nextraargs;
     let caller_closure = state.closure.clone();
     let caller_tbc_list = state.tbc_list;
-    // perf: caller_proto 延迟计算 (同 op_call), 从 state.stack[entry.func] 获取
-    state.call_info.push(crate::state::CallInfoEntry::full(
-        false,
-        None,
+    let caller_func = state.cur_func();
+    // perf: 元方法条目不再在调用前压入 —— 成功路径（绝大多数）根本没人看这条
+    // CallInfoEntry，压入它要给 FullCallInfo 分配一个 Box（每次元方法调用 1 次
+    // malloc/free）。改为只在真正需要时（错误 / yield）补压：
+    //  - 错误: 调用返回后把条目追加到 call_info 与 last_error_call_info 快照末尾
+    //    （语义位置就是最内层帧，与 C Lua 的 ci 链一致）；
+    //  - yield: resume 需要保留该帧。
+    // 非 Lua 闭包被调者走通用 pcall，它自己需要在调用前压条目（保持老行为）。
+    let is_lua = matches!(f, TValue::LClosure(_));
+    // 元方法帧条目 (namewhat="metamethod") 必须在调用**前**压栈:
+    // 元方法体内 `debug.getinfo(1).namewhat/name` 与 `error(msg, 2)` 的层级
+    // 都依赖它 (tests_lua/db.lua 有断言)。
+    push_meta_call_entry(
+        state,
+        tm,
         caller_base,
-        state.cur_func(),
+        caller_func,
         caller_pc,
-        Some(tm.event_name()),
-        "metamethod",
         caller_proto_flag,
         caller_nextraargs,
-    ));
+        false,
+    );
 
     // Push PcallProtection — 元方法 continuation 机制
     // yield 穿过元方法后，resume 时元方法返回，op_return 检测到 is_metamethod=true
@@ -469,7 +505,7 @@ pub(crate) fn call_tm_res<'a>(
     // 调用: 2 个参数, 1 个返回值 (对应 C 的 luaD_callnoyield(L, func, 1))
     // perf: 被调者是 Lua 闭包时走已压好元方法条目的精简入口 (跳过 __call 链
     // 解析与重复条目检测); 其他可调用对象 (C 函数/带 __call 的表等) 走通用 pcall。
-    let status = if matches!(f, TValue::LClosure(_)) {
+    let status = if is_lua {
         state.pcall_after_meta_entry(2, 1)
     } else {
         state.pcall(2, 1, 0)
@@ -589,18 +625,28 @@ pub(crate) fn call_tm<'a>(
     let caller_nextraargs = state.nextraargs;
     let caller_closure = state.closure.clone();
     let caller_tbc_list = state.tbc_list;
-    // perf: caller_proto 延迟计算 (同 op_call), 从 state.stack[entry.func] 获取
-    state.call_info.push(crate::state::CallInfoEntry::full(
-        false,
-        None,
+    let caller_func = state.cur_func();
+    // perf: 元方法条目不再在调用前压入 —— 成功路径（绝大多数）根本没人看这条
+    // CallInfoEntry，压入它要给 FullCallInfo 分配一个 Box（每次元方法调用 1 次
+    // malloc/free）。改为只在真正需要时（错误 / yield）补压：
+    //  - 错误: 调用返回后把条目追加到 call_info 与 last_error_call_info 快照末尾
+    //    （语义位置就是最内层帧，与 C Lua 的 ci 链一致）；
+    //  - yield: resume 需要保留该帧。
+    // 非 Lua 闭包被调者走通用 pcall，它自己需要在调用前压条目（保持老行为）。
+    let is_lua = matches!(f, TValue::LClosure(_));
+    // 元方法帧条目 (namewhat="metamethod") 必须在调用**前**压栈:
+    // 元方法体内 `debug.getinfo(1).namewhat/name` 与 `error(msg, 2)` 的层级
+    // 都依赖它 (tests_lua/db.lua 有断言)。
+    push_meta_call_entry(
+        state,
+        tm,
         caller_base,
-        state.cur_func(),
+        caller_func,
         caller_pc,
-        Some(tm.event_name()),
-        "metamethod",
         caller_proto_flag,
         caller_nextraargs,
-    ));
+        false,
+    );
 
     // Push PcallProtection — 元方法 continuation 机制
     // saved_pc 保留指向被中断的指令 (SETTABLE/SETI/SETFIELD), 不 +1,
@@ -632,7 +678,7 @@ pub(crate) fn call_tm<'a>(
     let mm_protection_idx = state.pcall_protection_stack.len() - 1;
 
     // 调用: 3 个参数, 0 个返回值
-    let status = if matches!(f, TValue::LClosure(_)) {
+    let status = if is_lua {
         state.pcall_after_meta_entry(3, 0)
     } else {
         state.pcall(3, 0, 0)

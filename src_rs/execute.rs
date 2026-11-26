@@ -7797,6 +7797,17 @@ impl VmExecutor {
                     Some(crate::state::CallInfoEntry::Lua { is_tailcall, .. }) => {
                         *is_tailcall = true;
                     }
+                    // 元方法条目: 尾调用标记不支持就地翻转 → 物化为 Full 再标记
+                    Some(e @ crate::state::CallInfoEntry::Meta { .. }) => {
+                        let mut full = crate::state::materialize_entry_slices(
+                            &state.stack,
+                            &state.call_stack,
+                            e,
+                        );
+                        full.is_tailcall = true;
+                        full.closure = Some(closure);
+                        *e = crate::state::CallInfoEntry::Full(Box::new(full));
+                    }
                     Some(crate::state::CallInfoEntry::Full(f)) => {
                         f.is_tailcall = true;
                         f.closure = Some(closure);

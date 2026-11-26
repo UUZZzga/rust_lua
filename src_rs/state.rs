@@ -3286,7 +3286,20 @@ pub enum CallInfoEntry<'a> {
     /// 帧存活期与条目一致（push/pop 同步）；字段派生关系见
     /// [`materialize_entry_slices`]。
     Lua { frame_idx: u32, is_tailcall: bool },
-    /// C 帧 / hook / 元方法 / pcall 等自包含条目
+    /// 元方法条目 — 内联存储（无 Box 分配），语义等价于
+    /// `Full { is_c: false, closure: None, name: Some(事件名), namewhat: "metamethod" }`。
+    /// 元方法调用是热路径（每次 `__index` / `__add` … 都会压一条），
+    /// 用 `Full` 会让每次调用多一次 malloc/free。
+    Meta {
+        base: u32,
+        func: u32,
+        saved_pc: u32,
+        /// 元方法事件名（`"index"` / `"add"` …），静态字符串
+        name: &'static str,
+        nextraargs: i32,
+        proto_flag: u8,
+    },
+    /// C 帧 / hook / pcall 等自包含条目
     Full(Box<FullCallInfo<'a>>),
 }
 
@@ -3319,6 +3332,26 @@ impl<'a> CallInfoEntry<'a> {
         }))
     }
 
+    /// 构造元方法条目（内联，无堆分配）。
+    #[inline]
+    pub fn meta(
+        base: usize,
+        func: usize,
+        saved_pc: usize,
+        name: &'static str,
+        proto_flag: u8,
+        nextraargs: i32,
+    ) -> Self {
+        Self::Meta {
+            base: base as u32,
+            func: func as u32,
+            saved_pc: saved_pc as u32,
+            name,
+            nextraargs,
+            proto_flag,
+        }
+    }
+
     /// 是否为 C 函数帧条目（对应 C 的 `!isLua(ci)`）。
     ///
     /// 语义与旧 `is_c` 字段完全一致：hook / 元方法 / `__gc` / pcall(Lua 调用者)
@@ -3334,6 +3367,7 @@ impl<'a> CallInfoEntry<'a> {
     pub fn is_tailcall(&self) -> bool {
         match self {
             Self::Lua { is_tailcall, .. } => *is_tailcall,
+            Self::Meta { .. } => false,
             Self::Full(f) => f.is_tailcall,
         }
     }
@@ -3343,6 +3377,7 @@ impl<'a> CallInfoEntry<'a> {
     pub fn name(&self) -> Option<&'static str> {
         match self {
             Self::Lua { .. } => None,
+            Self::Meta { name, .. } => Some(*name),
             Self::Full(f) => f.name,
         }
     }
@@ -3352,6 +3387,7 @@ impl<'a> CallInfoEntry<'a> {
     pub fn namewhat(&self) -> &'static str {
         match self {
             Self::Lua { .. } => "",
+            Self::Meta { .. } => "metamethod",
             Self::Full(f) => f.namewhat,
         }
     }
@@ -3363,6 +3399,7 @@ impl<'a> CallInfoEntry<'a> {
             Self::Lua { frame_idx, .. } => {
                 call_stack.get(*frame_idx as usize).map_or(0, |f| f.base)
             }
+            Self::Meta { base, .. } => *base as usize,
             Self::Full(f) => f.base,
         }
     }
@@ -3378,6 +3415,7 @@ impl<'a> CallInfoEntry<'a> {
             Self::Lua { frame_idx, .. } => call_stack
                 .get(*frame_idx as usize)
                 .map_or(0, |f| f.base.saturating_sub(1)),
+            Self::Meta { func, .. } => *func as usize,
             Self::Full(f) => f.func,
         }
     }
@@ -3389,6 +3427,7 @@ impl<'a> CallInfoEntry<'a> {
             Self::Lua { frame_idx, .. } => call_stack
                 .get(*frame_idx as usize)
                 .map_or(0, |f| f.return_pc.saturating_sub(1)),
+            Self::Meta { saved_pc, .. } => *saved_pc as usize,
             Self::Full(f) => f.saved_pc,
         }
     }
@@ -3400,6 +3439,7 @@ impl<'a> CallInfoEntry<'a> {
             Self::Lua { frame_idx, .. } => call_stack
                 .get(*frame_idx as usize)
                 .map_or(0, |f| f.proto_flag),
+            Self::Meta { proto_flag, .. } => *proto_flag,
             Self::Full(f) => f.proto_flag,
         }
     }
@@ -3411,6 +3451,7 @@ impl<'a> CallInfoEntry<'a> {
             Self::Lua { frame_idx, .. } => call_stack
                 .get(*frame_idx as usize)
                 .map_or(0, |f| f.nextraargs),
+            Self::Meta { nextraargs, .. } => *nextraargs,
             Self::Full(f) => f.nextraargs,
         }
     }
@@ -3439,6 +3480,11 @@ impl<'a> CallInfoEntry<'a> {
                     TValue::LClosure(c) => Some(c),
                     _ => None,
                 }),
+            // 元方法条目: closure=None，回退 `stack[func]`（与 Full{closure:None,is_c:false} 一致）
+            Self::Meta { func, .. } => stack.get(*func as usize).and_then(|v| match v {
+                TValue::LClosure(c) => Some(c),
+                _ => None,
+            }),
             Self::Full(f) => {
                 // 显式 closure 优先：pcall 分支（state.pcall 的 Lua 分支）以
                 // `is_c = !caller_is_lua` + `Some(closure)` 记录「C 调用者 → 被调
@@ -3479,6 +3525,28 @@ pub fn materialize_entry_slices<'a>(
 ) -> FullCallInfo<'a> {
     match entry {
         CallInfoEntry::Full(f) => (**f).clone(),
+        CallInfoEntry::Meta {
+            base,
+            func,
+            saved_pc,
+            name,
+            nextraargs,
+            proto_flag,
+        } => FullCallInfo {
+            is_c: false,
+            is_tailcall: false,
+            closure: stack.get(*func as usize).and_then(|v| match v {
+                TValue::LClosure(c) => Some(c.clone()),
+                _ => None,
+            }),
+            base: *base as usize,
+            func: *func as usize,
+            saved_pc: *saved_pc as usize,
+            name: Some(*name),
+            namewhat: "metamethod",
+            proto_flag: *proto_flag,
+            nextraargs: *nextraargs,
+        },
         CallInfoEntry::Lua {
             frame_idx,
             is_tailcall,
