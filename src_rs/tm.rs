@@ -467,7 +467,13 @@ pub(crate) fn call_tm_res<'a>(
     let mm_protection_idx = state.pcall_protection_stack.len() - 1;
 
     // 调用: 2 个参数, 1 个返回值 (对应 C 的 luaD_callnoyield(L, func, 1))
-    let status = state.pcall(2, 1, 0);
+    // perf: 被调者是 Lua 闭包时走已压好元方法条目的精简入口 (跳过 __call 链
+    // 解析与重复条目检测); 其他可调用对象 (C 函数/带 __call 的表等) 走通用 pcall。
+    let status = if matches!(f, TValue::LClosure(_)) {
+        state.pcall_after_meta_entry(2, 1)
+    } else {
+        state.pcall(2, 1, 0)
+    };
 
     // yield: 元方法 yield 时，state.pcall 返回 LUA_YIELD
     // 不截断栈、不 pop CallInfoEntry、不 pop PcallProtection、不恢复 saved 状态，
@@ -626,7 +632,11 @@ pub(crate) fn call_tm<'a>(
     let mm_protection_idx = state.pcall_protection_stack.len() - 1;
 
     // 调用: 3 个参数, 0 个返回值
-    let status = state.pcall(3, 0, 0);
+    let status = if matches!(f, TValue::LClosure(_)) {
+        state.pcall_after_meta_entry(3, 0)
+    } else {
+        state.pcall(3, 0, 0)
+    };
 
     // yield: 元方法 yield 时，state.pcall 返回 LUA_YIELD
     if status == crate::state::LUA_YIELD {
@@ -1034,11 +1044,23 @@ pub fn try_bin_tm<'a>(
     p2: TValue<'a>,
     res: usize,
     tm: TagMethod,
-    p1_info: String,
-    p2_info: String,
+    p1_reg: Option<usize>,
+    p2_reg: Option<usize>,
 ) -> Result<(), VmError<'a>> {
     if !callbin_tm(state, &p1, &p2, res, tm)? {
-        // 未找到元方法 — 根据事件类型报错
+        // 未找到元方法 — 根据事件类型报错。
+        // perf: 变量名信息（varinfo）只在报错路径才需要，此前在 opcode 处理臂
+        // 里无条件计算两次（每次 get_obj_name 都会扫局部变量表 + 反向扫字节码
+        // 定位写寄存器的指令并分配多个 String），元方法存在时纯粹是浪费。
+        // 现在只把寄存器号传下来，真正报错时才查。
+        let p1_info = match p1_reg {
+            Some(r) => crate::execute::varinfo_str_state(state, r),
+            None => String::new(),
+        };
+        let p2_info = match p2_reg {
+            Some(r) => crate::execute::varinfo_str_state(state, r),
+            None => String::new(),
+        };
         return Err(match tm {
             TagMethod::BAnd
             | TagMethod::BOr
@@ -1089,14 +1111,14 @@ pub fn try_bin_assoc_tm<'a>(
     flip: bool,
     res: usize,
     tm: TagMethod,
-    p1_info: String,
-    p2_info: String,
+    p1_reg: Option<usize>,
+    p2_reg: Option<usize>,
 ) -> Result<(), VmError<'a>> {
     if flip {
-        // flip 时传给 try_bin_tm 的是 (p2, p1)，info 也要对应交换
-        try_bin_tm(state, p2, p1, res, tm, p2_info, p1_info)
+        // flip 时传给 try_bin_tm 的是 (p2, p1)，寄存器信息也要对应交换
+        try_bin_tm(state, p2, p1, res, tm, p2_reg, p1_reg)
     } else {
-        try_bin_tm(state, p1, p2, res, tm, p1_info, p2_info)
+        try_bin_tm(state, p1, p2, res, tm, p1_reg, p2_reg)
     }
 }
 
@@ -1118,11 +1140,11 @@ pub fn try_bini_tm<'a>(
     flip: bool,
     res: usize,
     tm: TagMethod,
-    p1_info: String,
+    p1_reg: Option<usize>,
 ) -> Result<(), VmError<'a>> {
     let aux = TValue::Integer(i2);
     // i2 是立即数，没有寄存器位置，info 为空
-    try_bin_assoc_tm(state, p1, aux, flip, res, tm, p1_info, String::new())
+    try_bin_assoc_tm(state, p1, aux, flip, res, tm, p1_reg, None)
 }
 
 /// 尝试字符串拼接元方法 — 对应 C 的 luaT_tryconcatTM
@@ -1562,15 +1584,7 @@ mod tests {
         let p1 = TValue::Integer(1);
         let p2 = TValue::Integer(2);
         // 整数没有 __add 元方法，应返回 RuntimeError
-        let result = try_bin_tm(
-            &mut state,
-            p1,
-            p2,
-            0,
-            TagMethod::Add,
-            String::new(),
-            String::new(),
-        );
+        let result = try_bin_tm(&mut state, p1, p2, 0, TagMethod::Add, None, None);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, VmError::RuntimeError(_)));
@@ -1582,15 +1596,7 @@ mod tests {
         let mut state = LuaState::default();
         let p1 = TValue::Nil(NilKind::Strict);
         let p2 = TValue::Integer(1);
-        let result = try_bin_tm(
-            &mut state,
-            p1,
-            p2,
-            0,
-            TagMethod::Add,
-            String::new(),
-            String::new(),
-        );
+        let result = try_bin_tm(&mut state, p1, p2, 0, TagMethod::Add, None, None);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, VmError::RuntimeError(_)));

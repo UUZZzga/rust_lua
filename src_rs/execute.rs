@@ -1016,7 +1016,7 @@ fn varinfo_str<'a>(stack: &[TValue<'a>], func: usize, pc: usize, reg: usize) -> 
     }
 }
 
-fn varinfo_str_state<'a>(state: &LuaState<'a>, reg: usize) -> String {
+pub(crate) fn varinfo_str_state<'a>(state: &LuaState<'a>, reg: usize) -> String {
     // 帧有效性: base 为 0 或越界表示当前无 Lua 帧 (对应 C 的 isLua(L->ci) 检查)
     if state.base == 0 || state.base > state.top {
         return String::new();
@@ -4732,7 +4732,7 @@ impl VmExecutor {
         } else {
             TValue::Nil(NilKind::Strict)
         };
-        let result = Self::table_get(state, &upval_val, &key, VarSource::Upval(b))?;
+        let result = Self::table_get_missed(state, &upval_val, &key, VarSource::Upval(b))?;
         Self::write_stack_state(state, a, result);
         Ok(Next::Continue)
     }
@@ -4792,7 +4792,7 @@ impl VmExecutor {
         let c = Self::rc(base, inst);
         let table_val = Self::read_stack_state(state, b).clone();
         let key = Self::read_stack_state(state, c).clone();
-        let result = Self::table_get(
+        let result = Self::table_get_missed(
             state,
             &table_val,
             &key,
@@ -4852,7 +4852,7 @@ impl VmExecutor {
         let key = TValue::Integer(c);
         // 慢速路径: 原始读未命中且有元表 / 非 Table 类型, 需要走 table_get 查 __index
         let table_val = table_val.clone();
-        let result = Self::table_get(
+        let result = Self::table_get_missed(
             state,
             &table_val,
             &key,
@@ -4978,7 +4978,7 @@ impl VmExecutor {
         // 慢速路径: 原始读未命中且有元表 / 非 Table 类型 — 此处才 clone key
         let key = unsafe { state.cur_proto().constants.get_unchecked(c_key) }.clone();
         let table_val = Self::read_stack_state(state, b).clone();
-        let result = Self::table_get(
+        let result = Self::table_get_missed(
             state,
             &table_val,
             &key,
@@ -5902,9 +5902,16 @@ impl VmExecutor {
             // result = RA(pi), pi = 前一条指令 (原始算术指令)
             let pi = state.cur_proto().code[pc - 2];
             let result = Self::ra(base, pi);
-            let p1_info = varinfo_str_state(state, opcodes::getarg_a(inst) as usize);
-            let p2_info = varinfo_str_state(state, opcodes::getarg_b(inst) as usize);
-            try_bin_tm(state, p1.clone(), p2.clone(), result, tm, p1_info, p2_info)?;
+            // perf: varinfo 由 try_bin_tm 在报错路径惰性计算 (元方法存在时不分配)
+            try_bin_tm(
+                state,
+                p1.clone(),
+                p2.clone(),
+                result,
+                tm,
+                Some(opcodes::getarg_a(inst) as usize),
+                Some(opcodes::getarg_b(inst) as usize),
+            )?;
         } else {
             state.pc += 1;
         }
@@ -5929,8 +5936,16 @@ impl VmExecutor {
             let pi = state.cur_proto().code[pc - 2];
             let result = Self::ra(base, pi);
             state.pc = pc - 1; // sync (C savepc): 先同步, varinfo 回扫需要当前指令
-            let p1_info = varinfo_str_state(state, opcodes::getarg_a(inst) as usize);
-            try_bini_tm(state, p1, imm as LuaInteger, flip, result, tm, p1_info)?;
+                               // perf: varinfo 惰性计算 (报错路径才查)
+            try_bini_tm(
+                state,
+                p1,
+                imm as LuaInteger,
+                flip,
+                result,
+                tm,
+                Some(opcodes::getarg_a(inst) as usize),
+            )?;
         }
         Ok(Next::Continue)
     }
@@ -5954,8 +5969,17 @@ impl VmExecutor {
             let pi = state.cur_proto().code[pc - 2];
             let result = Self::ra(base, pi);
             state.pc = pc - 1; // sync (C savepc): 先同步, varinfo 回扫需要当前指令
-            let p1_info = varinfo_str_state(state, opcodes::getarg_a(inst) as usize);
-            try_bin_assoc_tm(state, p1, p2, flip, result, tm, p1_info, String::new())?;
+                               // perf: varinfo 惰性计算 (报错路径才查)
+            try_bin_assoc_tm(
+                state,
+                p1,
+                p2,
+                flip,
+                result,
+                tm,
+                Some(opcodes::getarg_a(inst) as usize),
+                None,
+            )?;
         }
         Ok(Next::Continue)
     }
@@ -5987,15 +6011,15 @@ impl VmExecutor {
         } else {
             // cold path：非 number，需调用 __unm 元方法（需 &mut state，必须 clone）
             let v = Self::read_stack_state(state, b).clone();
-            let info = varinfo_str_state(state, opcodes::getarg_b(inst) as usize);
+            // perf: varinfo 惰性计算 (报错路径才查)
             try_bin_tm(
                 state,
                 v.clone(),
                 v.clone(),
                 a,
                 TagMethod::Unm,
-                info.clone(),
-                info,
+                Some(opcodes::getarg_b(inst) as usize),
+                Some(opcodes::getarg_b(inst) as usize),
             )?;
         }
         state.pc += 1;
@@ -6024,15 +6048,15 @@ impl VmExecutor {
             // cold path：非整数，需调用 __bnot 元方法（需 &mut state，必须 clone）
             let v = Self::read_stack_state(state, b).clone();
             // result = ra (与 C 一致)
-            let info = varinfo_str_state(state, opcodes::getarg_b(inst) as usize);
+            // perf: varinfo 惰性计算 (报错路径才查)
             try_bin_tm(
                 state,
                 v.clone(),
                 v.clone(),
                 a,
                 TagMethod::BNot,
-                info.clone(),
-                info,
+                Some(opcodes::getarg_b(inst) as usize),
+                Some(opcodes::getarg_b(inst) as usize),
             )?;
         }
         state.pc += 1;
@@ -9381,9 +9405,32 @@ impl VmExecutor {
         key: &TValue<'a>,
         table_source: VarSource,
     ) -> Result<TValue<'a>, VmError<'a>> {
+        Self::table_get_impl(state, table_val, key, table_source, false)
+    }
+
+    /// `__index` 慢路径入口: 热路径已对**首个**表做过原始读并确认未命中,
+    /// 这里跳过重复的原始读查找（对应 C 的 `luaV_finishget` 只在 slot==NULL
+    /// 时才进入元方法分支的语义）。
+    pub fn table_get_missed<'a>(
+        state: &mut LuaState<'a>,
+        table_val: &TValue<'a>,
+        key: &TValue<'a>,
+        table_source: VarSource,
+    ) -> Result<TValue<'a>, VmError<'a>> {
+        Self::table_get_impl(state, table_val, key, table_source, true)
+    }
+
+    fn table_get_impl<'a>(
+        state: &mut LuaState<'a>,
+        table_val: &TValue<'a>,
+        key: &TValue<'a>,
+        table_source: VarSource,
+        first_raw_missed: bool,
+    ) -> Result<TValue<'a>, VmError<'a>> {
         // 对应 C Lua 的 luaV_finishget — 用循环代替递归，加 MAXTAGLOOP 限制
         // 防止 __index 链无限循环（如 a.__index = a 导致栈溢出）
         const MAXTAGLOOP: usize = 2000;
+        let mut skip_raw = first_raw_missed;
         // 优化：首次迭代直接借用 table_val，避免不必要的 clone。
         // 调用方已 clone 了 table_val，此处再 clone 是冗余的。
         // take() 将值移出 current（变为 None），使 curr 借用 owned 而非 current，
@@ -9395,26 +9442,33 @@ impl VmExecutor {
         for _ in 0..MAXTAGLOOP {
             let owned = current.take();
             let curr: &TValue = owned.as_ref().unwrap_or(table_val);
+            let skip_one = std::mem::replace(&mut skip_raw, false);
             match curr {
                 TValue::Table(t) => {
                     // 一次 borrow 内查找值 + 获取元表 — 消除 metamethod 路径的第二次 borrow
-                    let (val, has_mt) = t.get_and_metatable(key);
-                    if let Some(v) = val {
-                        if !matches!(v, TValue::Nil(_)) {
-                            return Ok(v);
+                    let mut has_mt = true;
+                    if !skip_one {
+                        let (val, mt_flag) = t.get_and_metatable(key);
+                        if let Some(v) = val {
+                            if !matches!(v, TValue::Nil(_)) {
+                                return Ok(v);
+                            }
                         }
+                        has_mt = mt_flag;
                     }
-                    // key 未命中: 仅在有元表时才 clone 元表查 __index (延迟 clone,
+                    // key 未命中: 仅在有元表时才查 __index (延迟到此处,
                     // 避免命中路径的冗余 Rc incq; all.lua table_get 占 10.67%)
                     if has_mt {
                         core::hint::cold_path();
-                        let mt = t.get_metatable();
-                        let tmnames = &state.tmnames;
-                        let index_val = mt.and_then(|mt| {
-                            let index_key =
-                                crate::tm::make_tm_tvalue(tmnames, crate::tm::TagMethod::Index);
-                            mt.get(&index_key)
-                        });
+                        // perf: 直接用「按对象查元方法」的零临时 clone 路径
+                        // (借元表槽 + 元方法名直查), 免去元表 Rc clone 与
+                        // make_tm_tvalue 构造 TValue 键。
+                        let index_val = crate::tm::get_tm_by_obj(
+                            curr,
+                            crate::tm::TagMethod::Index,
+                            &state.dmt,
+                            &state.tmnames,
+                        );
                         if let Some(index_val) = index_val {
                             match &index_val {
                                 TValue::Table(_) => {

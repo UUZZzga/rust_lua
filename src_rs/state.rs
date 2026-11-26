@@ -1550,6 +1550,18 @@ impl<'a> LuaState<'a> {
     }
 
     pub fn pcall(&mut self, nargs: usize, nresults: i32, _errfunc: isize) -> i32 {
+        self.pcall_impl(nargs, nresults, false)
+    }
+
+    /// 元方法调用专用 pcall 入口: 调用方 (`tm::call_tm_res`/`call_tm`) 已把元方法
+    /// 帧的 CallInfoEntry 压栈, 且已确认被调者是 Lua 闭包 —— 因此这里可以跳过
+    /// `__call` 元方法链解析与 `already_has_entry` 双重条目检测（两者在热路径上
+    /// 每次都要 clone TValue / 做 Rc::ptr_eq 比较）。
+    pub fn pcall_after_meta_entry(&mut self, nargs: usize, nresults: i32) -> i32 {
+        self.pcall_impl(nargs, nresults, true)
+    }
+
+    fn pcall_impl(&mut self, nargs: usize, nresults: i32, meta_prepared: bool) -> i32 {
         // 进入执行前绑定 l_g（规约 R1）
         self.bind_exec();
         // func_idx 是函数在栈中的 0-based 绝对索引。
@@ -1567,7 +1579,7 @@ impl<'a> LuaState<'a> {
         // (op_call/op_tailcall 已在 execute.rs 中处理此逻辑,但 pcall 直接
         //  调用 state.pcall,所以这里也需要相同的处理。)
         let mut chain_len: usize = 0;
-        loop {
+        while !meta_prepared {
             let cur_val = self.stack[func_idx].clone();
             if let TValue::Table(ref t) = cur_val {
                 let mt_opt = t.get_metatable();
@@ -1691,13 +1703,14 @@ impl<'a> LuaState<'a> {
                 let caller_is_lua = self.base > 0
                     && self.base <= self.top
                     && matches!(&self.stack[self.cur_func()], TValue::LClosure(_));
-                let already_has_entry = self.call_info.last().map_or(false, |e| {
-                    e.closure(&self.stack, &self.call_stack)
-                        .map_or(false, |c| Rc::ptr_eq(&c.proto, &proto))
-                        || get_closure_from_stack(&self.stack, &self.call_stack, e)
+                let already_has_entry = meta_prepared
+                    || self.call_info.last().map_or(false, |e| {
+                        e.closure(&self.stack, &self.call_stack)
                             .map_or(false, |c| Rc::ptr_eq(&c.proto, &proto))
-                        || (!e.namewhat().is_empty() && !e.is_c())
-                });
+                            || get_closure_from_stack(&self.stack, &self.call_stack, e)
+                                .map_or(false, |c| Rc::ptr_eq(&c.proto, &proto))
+                            || (!e.namewhat().is_empty() && !e.is_c())
+                    });
                 let pushed_call_info = !already_has_entry;
                 if pushed_call_info {
                     let (caller_base, caller_pc) = if caller_is_lua {
@@ -2205,25 +2218,28 @@ impl<'a> LuaState<'a> {
                         } else {
                             nresults as usize
                         };
-
-                        // 从 result_base 位置取结果（可能是 VARARGPREP 调整后的 base）
-                        let mut tmp_results = Vec::new();
-                        for i in 0..nret {
-                            if result_base + i < self.top {
-                                let v = std::mem::take(&mut self.stack[result_base + i]);
-                                tmp_results.push(v);
+                        // perf: 直接在栈上把结果搬到 func_idx，避免中途 Vec 分配
+                        // (元方法调用每次 pcall 都走这里, 1 次 malloc 在热路径上不可忽略)。
+                        // 搬运方向恒为低地址 (result_base > func_idx)，且用 replace 把源槽
+                        // 置 Nil(Empty)，随后 truncate_live 不会二次释放。
+                        self.prepare_slots(func_idx + expected);
+                        let ncopy = nret.min(expected);
+                        for i in 0..ncopy {
+                            let src = result_base + i;
+                            if src < self.top {
+                                let v = std::mem::replace(
+                                    &mut self.stack[src],
+                                    TValue::Nil(NilKind::Empty),
+                                );
+                                self.stack[func_idx + i] = v;
                             } else {
-                                tmp_results.push(TValue::Nil(NilKind::Strict));
+                                self.stack[func_idx + i] = TValue::Nil(NilKind::Strict);
                             }
                         }
-                        self.truncate_live(func_idx);
-                        for i in 0..expected {
-                            if i < tmp_results.len() {
-                                self.push_value(std::mem::take(&mut tmp_results[i]));
-                            } else {
-                                self.push_nil();
-                            }
+                        for i in ncopy..expected {
+                            self.stack[func_idx + i] = TValue::Nil(NilKind::Strict);
                         }
+                        self.truncate_live(func_idx + expected);
                         if pushed_call_info {
                             self.call_info.pop();
                         }
