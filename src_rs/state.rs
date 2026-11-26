@@ -3940,7 +3940,13 @@ impl<'a> GlobalState<'a> {
     }
 
     pub fn gc_restart(&mut self) {
-        unsafe { self.gc.as_mut().gc_stop.set(0) };
+        unsafe {
+            let g = self.gc.as_mut();
+            g.gc_stop.set(0);
+            // 停止期间滞留的垃圾计费在恢复时结算：gc.lua 的 pace 测试在 restart
+            // 后要求 count 回落到 2x 以内（C 中由恢复后首次分配触发的回收达成）。
+            g.flush_pending_death_bytes();
+        }
     }
 
     pub fn gc_gen(&mut self) {

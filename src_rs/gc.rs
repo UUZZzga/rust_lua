@@ -246,7 +246,7 @@ unsafe fn early_unregister(owner: *const u8, id32: u32) {
     // 生命周期擦除：仅访问与 'a 无关的字段（objects / pending_death_bytes / pending_deaths）。
     let gc: &GCState<'static> = &*(owner as *const GCState<'static>);
     match gc.objects.try_borrow_mut() {
-        Ok(mut objs) => GCState::early_unregister_locked(&mut objs, id32, &gc.pending_death_bytes),
+        Ok(mut objs) => GCState::early_unregister_locked(&mut objs, id32, gc),
         Err(_) => {
             // pending_deaths 与 objects 是不同的 RefCell；两次借用都失败
             //（只可能发生在嵌套 drain 中）时丢弃 —— meta 保留，sweep 兜底。
@@ -629,6 +629,14 @@ pub struct GCState<'a> {
     aux_marked: RefCell<HashSet<usize, FxBuildHasher>>,
     pub gc_debt: Cell<isize>,
     pub gc_estimate: Cell<usize>,
+    /// 上一次完整回收以来**累计分配**的字节数（单调递增，回收点清零）。
+    ///
+    /// 用于给 finalizer 兜底触发限速：早释放架构下普通垃圾死亡即扣减，
+    /// estimate 可能长期不涨，`finobj_has_garbage` 若每次分配都强制回收会形成
+    /// GC 风暴（实测 tests_lua/all.lua：本实现 23k 次周期 vs C 版 1.4k 次，
+    /// tracegc 的 __gc 里 remark 自身导致 fin_due 永真）。改为「累计分配量
+    /// 达到预算才强制一次」后与 C 的周期频率同量级。
+    pub alloc_since_cycle: Cell<usize>,
     /// 无 gc_header 对象（String/Proto/CClosure/RustClosure/LuaThread）的估算占用。
     /// 这些对象不调用 register_object，无法通过 gc_estimate 跟踪。
     /// 创建后由 collect_gc 通过 set_extra_estimate 重算（精确）。
@@ -692,6 +700,7 @@ impl<'a> GCState<'a> {
             ephemeron: RefCell::new(VecDeque::with_capacity(64)),
             aux_marked: RefCell::new(aux),
             gc_debt: Cell::new(0),
+            alloc_since_cycle: Cell::new(0),
             gc_estimate: Cell::new(0),
             gc_extra_estimate: Cell::new(0),
             gc_stop: Cell::new(0),
@@ -741,13 +750,30 @@ impl<'a> GCState<'a> {
         }
     }
 
+    /// 结算 GC 停止期间滞留的垃圾计费（GC 恢复或回收点调用）。
+    ///
+    /// 停止期间死亡的对象只累加 `pending_death_bytes`（保持
+    /// `collectgarbage"count"` 单调增长）；在恢复/回收时统一从
+    /// `gc_estimate` 扣减，与 C 中「恢复后首次分配触发的回收」可观测效果一致。
+    pub(crate) fn flush_pending_death_bytes(&self) {
+        let pend = self.pending_death_bytes.replace(0);
+        if pend != 0 {
+            self.gc_estimate
+                .set(self.gc_estimate.get().saturating_sub(pend));
+        }
+    }
+
     /// 清除一个已死对象的 meta（free_ids 复用 + 活跃计数 + 计费暂存）。
     ///
     /// 与 [`GCState::sweep_unreachable`] 的释放记账逐点一致：sweep 侧 subtract
-    /// `meta.size.max(32)`、push free_ids 带 try_reserve 守卫，此处同形。区别是
-    /// 计费**不在此扣减**，而是累加到 `pending_death_bytes`，由回收点统一扣减
-    ///（保持 GC 停止期间 `collectgarbage"count"` 单调增长，与 C 一致）。
-    fn early_unregister_locked(objs: &mut GcObjects<'_>, id32: u32, death_bytes: &Cell<usize>) {
+    /// `meta.size.max(32)`、push free_ids 带 try_reserve 守卫，此处同形。
+    ///
+    /// 计费策略（对齐 C 的可观测行为，同时避免已释放垃圾反复触发回收）：
+    /// - GC 运行中：立即从 `gc_estimate` 扣减 —— 垃圾已真实释放，不该再推高阈值；
+    ///   否则大活集场景（tests_lua/big.lua）会因「已死垃圾」反复越过阈值而抖动。
+    /// - GC 停止中：累加到 `pending_death_bytes`，保持 `collectgarbage"count"`
+    ///   随垃圾单调增长（gc.lua 的 pace/step 测试依赖）；恢复或回收点统一结算。
+    fn early_unregister_locked(objs: &mut GcObjects<'_>, id32: u32, gc: &GCState<'_>) {
         let id = id32 as usize;
         if id >= objs.metas.len() {
             return;
@@ -759,7 +785,14 @@ impl<'a> GCState<'a> {
             {
                 objs.free_ids.push(id as u32);
             }
-            death_bytes.set(death_bytes.get().saturating_add(meta.size.max(32) as usize));
+            let bytes = meta.size.max(32) as usize;
+            if gc.is_running() {
+                gc.gc_estimate
+                    .set(gc.gc_estimate.get().saturating_sub(bytes));
+            } else {
+                gc.pending_death_bytes
+                    .set(gc.pending_death_bytes.get().saturating_add(bytes));
+            }
         }
     }
 
@@ -775,7 +808,7 @@ impl<'a> GCState<'a> {
             let id32 = list[i];
             match self.objects.try_borrow_mut() {
                 Ok(mut objs) => {
-                    GCState::early_unregister_locked(&mut objs, id32, &self.pending_death_bytes);
+                    GCState::early_unregister_locked(&mut objs, id32, self);
                     list.swap_remove(i);
                 }
                 Err(_) => i += 1,
@@ -881,6 +914,12 @@ impl<'a> GCState<'a> {
         self.gc_debt.set(current - charged);
         let estimate = self.gc_estimate.get();
         self.gc_estimate.set(estimate + charged as usize);
+        // 累计分配量（finalizer 兜底触发的限速依据，回收点清零）
+        self.alloc_since_cycle.set(
+            self.alloc_since_cycle
+                .get()
+                .saturating_add(charged as usize),
+        );
 
         Ok(id)
     }
@@ -1403,6 +1442,13 @@ impl<'a> GCState<'a> {
             meta.size = size.min(u32::MAX as usize) as u32;
             let estimate = self.gc_estimate.get();
             self.gc_estimate.set(estimate + new_charged - old_charged);
+            if new_charged > old_charged {
+                self.alloc_since_cycle.set(
+                    self.alloc_since_cycle
+                        .get()
+                        .saturating_add(new_charged - old_charged),
+                );
+            }
         }
     }
 
@@ -1644,11 +1690,19 @@ impl<'a> LuaState<'a> {
         // 持有 = 已变垃圾）的对象时强制跑一次周期，分离并执行 finalizer。
         // 列表通常为空，检查成本 ~2 次 borrow + len 判断。
         let fin_due = self.g_mut().finobj_has_garbage();
-        let (running, over) = unsafe {
+        let (running, over, budget_hit) = unsafe {
             let g = self.gc_mut();
-            (g.is_running(), g.total_estimate() > g.collect_threshold())
+            // finalizer 兜底触发的限速预算：与 C 的周期频率同量级（live/2，下限 64KB）。
+            // 不限速时 tracegc 的 __gc 中 remark 自身会让 fin_due 恒真，
+            // 每次 maybe_collect_gc 都跑完整周期（实测 all.lua 23k 次 vs C 1.4k 次）。
+            let budget = (g.total_estimate() / 2).max(64 * 1024);
+            (
+                g.is_running(),
+                g.total_estimate() > g.collect_threshold(),
+                g.alloc_since_cycle.get() >= budget,
+            )
         };
-        if running && (over || fin_due) {
+        if running && (over || (fin_due && budget_hit)) {
             gc_trigger_inc(self.g(), GcTrigger::Maybe);
             self.collect_gc();
         }
@@ -1823,16 +1877,8 @@ impl<'a> LuaState<'a> {
         // sweep 借用期间挂起的死亡通知（clear_for_drop 连锁 drop 触发）就地排空
         unsafe { self.gc_mut().drain_pending_deaths() };
 
-        // 早释放对象的计费在**回收点**统一扣减（对应 C 中 sweep 才回收垃圾）。
-        // 死亡时只暂存字节数，保证 GC 停止/step 期间 `collectgarbage"count"`
-        // 随垃圾单调增长，与 C 语义一致（tests_lua/gc.lua 的 pace 测试依赖）。
-        unsafe {
-            let g = self.gc_mut();
-            let pend = g.pending_death_bytes.replace(0);
-            if pend != 0 {
-                g.gc_estimate.set(g.gc_estimate.get().saturating_sub(pend));
-            }
-        }
+        // 结算 GC 停止期间滞留的垃圾计费（停止期 count 单调增长，回收点扣减）。
+        unsafe { self.gc_mut().flush_pending_death_bytes() };
 
         // 字符串表清理
         let str_sweep_start = if gc_stats_enabled() {
@@ -1908,6 +1954,8 @@ impl<'a> LuaState<'a> {
             g.set_collect_threshold(new_threshold);
             g.set_debt(100);
             g.step_accum.set(0);
+            // 本周期结算完毕：累计分配量清零（finalizer 兜底触发的限速窗口）
+            g.alloc_since_cycle.set(0);
         }
 
         if gc_stats_enabled() {
