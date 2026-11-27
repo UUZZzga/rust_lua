@@ -367,6 +367,17 @@ impl std::error::Error for TagMethodError {}
 // 元方法调用 (ltm.cpp → Rust) — 与 C API 完全一致
 // ============================================================================
 
+/// 二元元方法调用结果 — [`try_bin_tm`] 族与 [`VmExecutor::call_meta_push`]
+/// 之间的控制流协议。
+#[derive(Debug)]
+pub enum TmCall {
+    /// 同步完成（C 函数元方法走旧 pcall 路径 / 字符串算术）— 结果已写 res 槽
+    Done,
+    /// LClosure 元方法帧已压入 call_stack — 结果将由帧返回（return_base=res、
+    /// return_pc=被中断指令+1）写入；调用方返回 `Next::Reload` 交还主循环
+    Pushed,
+}
+
 /// 调用元方法并将结果写入栈 — 对应 C 的 luaT_callTMres
 ///
 /// C 实现:
@@ -992,6 +1003,72 @@ fn callbin_tm<'a>(
     }
 }
 
+/// 二元元方法查找结果 — [`callbin_tm_push`] 的内部协议。
+enum TmFound<'a> {
+    /// 未命中元方法 — 携回 p1/p2 原值供 [`try_bin_tm`] 报错
+    Miss(TValue<'a>, TValue<'a>),
+    /// 同步完成（旧 pcall 路径 / 字符串算术）— 结果已写 res 槽
+    Done,
+    /// LClosure 元方法帧已压入 call_stack — 调用方返回 `Next::Reload`
+    Pushed,
+}
+
+/// 二元元方法直调（压帧版）— [`callbin_tm`] 的 VM 内压帧变体。
+///
+/// 与 [`callbin_tm`] 的差异仅在「命中元方法」分支：被调者为**非变参 Lua 闭包**
+/// 时经 [`VmExecutor::call_meta_push`] 在 VM 内直接压帧执行（省去 `state.pcall`
+/// 嵌套解释器的整套进出开销），返回 [`TmFound::Pushed`] 交还主循环；
+/// 其余（C 函数 / 变参闭包等）走旧同步路径。未命中时携回 p1/p2 原值，
+/// 报错逻辑留在 [`try_bin_tm`]（varinfo 惰性计算）。
+fn callbin_tm_push<'a>(
+    state: &mut LuaState<'a>,
+    p1: TValue<'a>,
+    p2: TValue<'a>,
+    res: usize,
+    tm: TagMethod,
+) -> Result<TmFound<'a>, VmError<'a>> {
+    // 压 scratch / 走字符串算术快速路径前抬高 live top (对应 C 调用点的 `Protect(p1, p2)`)
+    state.savestate();
+    // 先从 p1 查找元方法，再从 p2 查找 — 对应 C 的 callbinTM
+    let tm_val = get_tm_by_obj(&p1, tm, &state.dmt, &state.tmnames)
+        .or_else(|| get_tm_by_obj(&p2, tm, &state.dmt, &state.tmnames));
+
+    match tm_val {
+        Some(f) => {
+            // 字符串算术元方法占位符 (Integer(0)) — 同 callbin_tm, 同步完成
+            if let TValue::Integer(0) = f {
+                if string_arith(state, &p1, &p2, res, tm)? {
+                    return Ok(TmFound::Done);
+                }
+                // 字符串算术失败 — 对应 C 的 trymt: 查找 p2 的元方法
+                if let Some(f2) = get_tm_by_obj(&p2, tm, &state.dmt, &state.tmnames) {
+                    if !matches!(f2, TValue::Integer(0)) {
+                        return match crate::execute::VmExecutor::call_meta_push(
+                            state, f2, p1, p2, res, tm,
+                        )? {
+                            TmCall::Pushed => Ok(TmFound::Pushed),
+                            TmCall::Done => Ok(TmFound::Done),
+                        };
+                    }
+                }
+                // p2 没有非占位元方法 — 报错 (对应 trymt 中 p2 是 LUA_TSTRING)
+                let opname = tm.event_name();
+                let t1 = obj_type_name_(&state.string_table, &p1);
+                let t2 = obj_type_name_(&state.string_table, &p2);
+                return Err(VmError::RuntimeError(format!(
+                    "attempt to {} a '{}' with a '{}'",
+                    opname, t1, t2
+                )));
+            }
+            match crate::execute::VmExecutor::call_meta_push(state, f, p1, p2, res, tm)? {
+                TmCall::Pushed => Ok(TmFound::Pushed),
+                TmCall::Done => Ok(TmFound::Done),
+            }
+        }
+        None => Ok(TmFound::Miss(p1, p2)),
+    }
+}
+
 /// 字符串算术元方法 — 对应 C Lua 的 arith_add/arith_sub 等函数
 ///
 /// C 实现 (lstrlib.cpp):
@@ -1105,6 +1182,7 @@ fn string_arith<'a>(
 /// ```
 ///
 /// 找到元方法时调用它并将结果写入 res 槽位；未找到时返回 VmError。
+/// 命中且被调者为非变参 Lua 闭包时走 VM 内压帧路径（[`TmCall::Pushed`]）。
 pub fn try_bin_tm<'a>(
     state: &mut LuaState<'a>,
     p1: TValue<'a>,
@@ -1113,55 +1191,56 @@ pub fn try_bin_tm<'a>(
     tm: TagMethod,
     p1_reg: Option<usize>,
     p2_reg: Option<usize>,
-) -> Result<(), VmError<'a>> {
-    // perf: p1/p2 按值传入 callbin_tm —— 命中元方法时直接 move 进元方法栈槽,
+) -> Result<TmCall, VmError<'a>> {
+    // perf: p1/p2 按值传入 callbin_tm_push —— 命中元方法时直接 move 进元方法栈槽,
     // 未命中时原样带回用于报错 (省两次 Rc inc/dec)。
-    let (found, p1, p2) = callbin_tm(state, p1, p2, res, tm)?;
-    if !found {
-        // 未找到元方法 — 根据事件类型报错。
-        // perf: 变量名信息（varinfo）只在报错路径才需要，此前在 opcode 处理臂
-        // 里无条件计算两次（每次 get_obj_name 都会扫局部变量表 + 反向扫字节码
-        // 定位写寄存器的指令并分配多个 String），元方法存在时纯粹是浪费。
-        // 现在只把寄存器号传下来，真正报错时才查。
-        let p1_info = match p1_reg {
-            Some(r) => crate::execute::varinfo_str_state(state, r),
-            None => String::new(),
-        };
-        let p2_info = match p2_reg {
-            Some(r) => crate::execute::varinfo_str_state(state, r),
-            None => String::new(),
-        };
-        return Err(match tm {
-            TagMethod::BAnd
-            | TagMethod::BOr
-            | TagMethod::BXor
-            | TagMethod::Shl
-            | TagMethod::Shr
-            | TagMethod::BNot => {
-                if p1.is_number() && p2.is_number() {
-                    tointerror(&p1, &p2, &p1_info, &p2_info)
-                } else {
-                    opinterror(
-                        &state.string_table,
-                        &p1,
-                        &p2,
-                        "perform bitwise operation on",
-                        &p1_info,
-                        &p2_info,
-                    )
-                }
+    let (p1, p2) = match callbin_tm_push(state, p1, p2, res, tm)? {
+        TmFound::Pushed => return Ok(TmCall::Pushed),
+        TmFound::Done => return Ok(TmCall::Done),
+        TmFound::Miss(p1, p2) => (p1, p2),
+    };
+    // 未找到元方法 — 根据事件类型报错。
+    // perf: 变量名信息（varinfo）只在报错路径才需要，此前在 opcode 处理臂
+    // 里无条件计算两次（每次 get_obj_name 都会扫局部变量表 + 反向扫字节码
+    // 定位写寄存器的指令并分配多个 String），元方法存在时纯粹是浪费。
+    // 现在只把寄存器号传下来，真正报错时才查。
+    let p1_info = match p1_reg {
+        Some(r) => crate::execute::varinfo_str_state(state, r),
+        None => String::new(),
+    };
+    let p2_info = match p2_reg {
+        Some(r) => crate::execute::varinfo_str_state(state, r),
+        None => String::new(),
+    };
+    Err(match tm {
+        TagMethod::BAnd
+        | TagMethod::BOr
+        | TagMethod::BXor
+        | TagMethod::Shl
+        | TagMethod::Shr
+        | TagMethod::BNot => {
+            if p1.is_number() && p2.is_number() {
+                tointerror(&p1, &p2, &p1_info, &p2_info)
+            } else {
+                opinterror(
+                    &state.string_table,
+                    &p1,
+                    &p2,
+                    "perform bitwise operation on",
+                    &p1_info,
+                    &p2_info,
+                )
             }
-            _ => opinterror(
-                &state.string_table,
-                &p1,
-                &p2,
-                "perform arithmetic on",
-                &p1_info,
-                &p2_info,
-            ),
-        });
-    }
-    Ok(())
+        }
+        _ => opinterror(
+            &state.string_table,
+            &p1,
+            &p2,
+            "perform arithmetic on",
+            &p1_info,
+            &p2_info,
+        ),
+    })
 }
 
 /// 尝试关联二元元方法 — 对应 C 的 luaT_trybinassocTM
@@ -1183,7 +1262,7 @@ pub fn try_bin_assoc_tm<'a>(
     tm: TagMethod,
     p1_reg: Option<usize>,
     p2_reg: Option<usize>,
-) -> Result<(), VmError<'a>> {
+) -> Result<TmCall, VmError<'a>> {
     if flip {
         // flip 时传给 try_bin_tm 的是 (p2, p1)，寄存器信息也要对应交换
         try_bin_tm(state, p2, p1, res, tm, p2_reg, p1_reg)
@@ -1211,7 +1290,7 @@ pub fn try_bini_tm<'a>(
     res: usize,
     tm: TagMethod,
     p1_reg: Option<usize>,
-) -> Result<(), VmError<'a>> {
+) -> Result<TmCall, VmError<'a>> {
     let aux = TValue::Integer(i2);
     // i2 是立即数，没有寄存器位置，info 为空
     try_bin_assoc_tm(state, p1, aux, flip, res, tm, p1_reg, None)

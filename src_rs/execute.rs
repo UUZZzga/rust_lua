@@ -18,8 +18,8 @@ use crate::config::{LuaInteger, LuaNumber, LuaUnsigned, MAX_INTEGER, MIN_INTEGER
 use crate::helper::jmp_ptr;
 use crate::mem::SlotAlloc;
 use crate::objects::{
-    CallFrame, Instruction, LClosure, LuaType, NilKind, Proto, TValue, UpVal, UpValVec, NO_UPVAL,
-    PF_VAHID, PF_VATAB,
+    CallFrame, Instruction, LClosure, LuaType, NilKind, Proto, TValue, UpVal, UpValVec,
+    META_NUM_RESULTS, NO_UPVAL, PF_VAHID, PF_VATAB,
 };
 use crate::opcodes::{self, OpCode};
 use crate::state::{LuaState, LUAI_MAXCCALLS, LUA_MINSTACK, MAX_CALL_CHAIN};
@@ -27,7 +27,7 @@ use crate::strings::lua_string_as_str;
 use crate::table::Table;
 use crate::tm::{
     call_order_tm, call_orderi_tm, equal_obj, obj_len, obj_type_name, try_bin_assoc_tm, try_bin_tm,
-    try_bini_tm, try_concat_tm, TagMethod,
+    try_bini_tm, try_concat_tm, TagMethod, TmCall,
 };
 use crate::vm::{
     concat_stack, float_to_integer, idiv, is_false, modulus, modulus_float, raw_equal, shiftl,
@@ -75,6 +75,19 @@ enum Next {
     Skip,
     /// 跳到索引 idx
     Jump(usize),
+    /// 元方法帧已压入 call_stack（`call_meta_push`）— state.pc 已指向元方法帧
+    /// 的第 0 条指令；交还主循环（`continue 'outer`）整轮重载后执行元方法体。
+    /// 被中断指令的完成由帧的 return_pc/return_base 在标准 poscall 中自然完成。
+    Reload,
+}
+
+/// 表读结果 — [`VmExecutor::table_get_impl`] 的控制流协议。
+pub(crate) enum GetOutcome<'a> {
+    /// 同步完成: 结果值就绪（原始读命中 / C 函数等元方法已同步调完）
+    Value(TValue<'a>),
+    /// LClosure `__index` 帧已压入 call_stack — 结果将由帧返回写入 dest 寄存器,
+    /// opcode 臂应返回 `Next::Reload` 交还主循环
+    Pushed,
 }
 
 // ============================================================================
@@ -2244,6 +2257,7 @@ impl VmExecutor {
                 // Skip/Jump 刷新 `trap` (state.hook_mask 缓存, 见循环头注释)。
                 match next {
                     Next::Continue => {}
+                    Next::Reload => continue 'outer,
                     Next::Skip => {
                         set_pc!(next_pc!() + 1);
                         trap = state.hook_mask;
@@ -4745,9 +4759,15 @@ impl VmExecutor {
         } else {
             TValue::Nil(NilKind::Strict)
         };
-        let result = Self::table_get_missed(state, &upval_val, &key, VarSource::Upval(b))?;
-        Self::write_stack_state(state, a, result);
-        Ok(Next::Continue)
+        match Self::table_get_missed_dest(state, &upval_val, &key, VarSource::Upval(b), a)? {
+            GetOutcome::Value(result) => {
+                Self::write_stack_state(state, a, result);
+                Ok(Next::Continue)
+            }
+            // LClosure __index 帧已压: 结果由帧返回写入 a (return_base=a),
+            // state.pc 已指向元方法帧第 0 条指令
+            GetOutcome::Pushed => Ok(Next::Reload),
+        }
     }
 
     /// GETTABLE 热路径 (同 [`Self::op_geti`]): 只做「原始读」的直查 (命中即返回,
@@ -4805,14 +4825,21 @@ impl VmExecutor {
         let c = Self::rc(base, inst);
         let table_val = Self::read_stack_state(state, b).clone();
         let key = Self::read_stack_state(state, c).clone();
-        let result = Self::table_get_missed(
+        match Self::table_get_missed_dest(
             state,
             &table_val,
             &key,
             VarSource::Reg(opcodes::getarg_b(inst) as usize),
-        )?;
-        Self::write_stack_state(state, a, result);
-        Ok(Next::Continue)
+            a,
+        )? {
+            GetOutcome::Value(result) => {
+                Self::write_stack_state(state, a, result);
+                Ok(Next::Continue)
+            }
+            // LClosure __index 帧已压: 结果由帧返回写入 a (return_base=a),
+            // state.pc 已指向元方法帧第 0 条指令
+            GetOutcome::Pushed => Ok(Next::Reload),
+        }
     }
 
     #[inline]
@@ -4865,14 +4892,21 @@ impl VmExecutor {
         let key = TValue::Integer(c);
         // 慢速路径: 原始读未命中且有元表 / 非 Table 类型, 需要走 table_get 查 __index
         let table_val = table_val.clone();
-        let result = Self::table_get_missed(
+        match Self::table_get_missed_dest(
             state,
             &table_val,
             &key,
             VarSource::Reg(opcodes::getarg_b(inst) as usize),
-        )?;
-        Self::write_stack_state(state, a, result);
-        Ok(Next::Continue)
+            a,
+        )? {
+            GetOutcome::Value(result) => {
+                Self::write_stack_state(state, a, result);
+                Ok(Next::Continue)
+            }
+            // LClosure __index 帧已压: 结果由帧返回写入 a (return_base=a),
+            // state.pc 已指向元方法帧第 0 条指令
+            GetOutcome::Pushed => Ok(Next::Reload),
+        }
     }
 
     #[inline]
@@ -4991,14 +5025,21 @@ impl VmExecutor {
         // 慢速路径: 原始读未命中且有元表 / 非 Table 类型 — 此处才 clone key
         let key = unsafe { state.cur_proto().constants.get_unchecked(c_key) }.clone();
         let table_val = Self::read_stack_state(state, b).clone();
-        let result = Self::table_get_missed(
+        match Self::table_get_missed_dest(
             state,
             &table_val,
             &key,
             VarSource::Reg(opcodes::getarg_b(inst) as usize),
-        )?;
-        Self::write_stack_state(state, a, result);
-        Ok(Next::Continue)
+            a,
+        )? {
+            GetOutcome::Value(result) => {
+                Self::write_stack_state(state, a, result);
+                Ok(Next::Continue)
+            }
+            // LClosure __index 帧已压: 结果由帧返回写入 a (return_base=a),
+            // state.pc 已指向元方法帧第 0 条指令
+            GetOutcome::Pushed => Ok(Next::Reload),
+        }
     }
 
     /// SETTABUP 热路径 (`_ENV.x = v` / `upval[k] = v`): upvalue 持「无元表 Table」
@@ -5340,15 +5381,23 @@ impl VmExecutor {
         // 慢速路径: 原始读未命中且有元表 / 非 Table 类型
         let obj = Self::read_stack_state(state, b).clone();
         Self::write_stack_state(state, a + 1, obj.clone());
-        let result = Self::table_get(
+        match Self::table_get_dest(
             state,
             &obj,
             &key,
             VarSource::Reg(opcodes::getarg_b(inst) as usize),
-        )?;
-        Self::write_stack_state(state, a, result);
-        state.pc += 1;
-        Ok(())
+            a,
+        )? {
+            GetOutcome::Value(result) => {
+                Self::write_stack_state(state, a, result);
+                state.pc += 1;
+                Ok(())
+            }
+            // LClosure __index 帧已压: 结果由帧返回写入 a (return_base=a),
+            // state.pc 已指向元方法帧第 0 条指令 — 冷分发收尾的 reload_istream
+            // 会从 state.pc 重载指令流, 直接交还即可 (不得 pc += 1)
+            GetOutcome::Pushed => Ok(()),
+        }
     }
 
     // ---- 算术运算 (param-pc: 成功 *pc += 1 跳过 MMBIN, 对应 C 宏内 pc++) ----
@@ -5916,7 +5965,7 @@ impl VmExecutor {
             let pi = state.cur_proto().code[pc - 2];
             let result = Self::ra(base, pi);
             // perf: varinfo 由 try_bin_tm 在报错路径惰性计算 (元方法存在时不分配)
-            try_bin_tm(
+            match try_bin_tm(
                 state,
                 p1.clone(),
                 p2.clone(),
@@ -5924,7 +5973,13 @@ impl VmExecutor {
                 tm,
                 Some(opcodes::getarg_a(inst) as usize),
                 Some(opcodes::getarg_b(inst) as usize),
-            )?;
+            )? {
+                // LClosure 元方法帧已压: 结果由帧返回写入 RA(pi) (return_base=result),
+                // state.pc 已指向元方法帧第 0 条; 本指令 (MMBIN) 由帧的
+                // return_pc (= 本指令 + 1) 在 poscall 中自然跳过
+                TmCall::Pushed => return Ok(Next::Reload),
+                TmCall::Done => {}
+            }
         } else {
             state.pc += 1;
         }
@@ -5950,7 +6005,7 @@ impl VmExecutor {
             let result = Self::ra(base, pi);
             state.pc = pc - 1; // sync (C savepc): 先同步, varinfo 回扫需要当前指令
                                // perf: varinfo 惰性计算 (报错路径才查)
-            try_bini_tm(
+            match try_bini_tm(
                 state,
                 p1,
                 imm as LuaInteger,
@@ -5958,7 +6013,11 @@ impl VmExecutor {
                 result,
                 tm,
                 Some(opcodes::getarg_a(inst) as usize),
-            )?;
+            )? {
+                // LClosure 元方法帧已压 — 见 op_mmbin 注释
+                TmCall::Pushed => return Ok(Next::Reload),
+                TmCall::Done => {}
+            }
         }
         Ok(Next::Continue)
     }
@@ -5983,7 +6042,7 @@ impl VmExecutor {
             let result = Self::ra(base, pi);
             state.pc = pc - 1; // sync (C savepc): 先同步, varinfo 回扫需要当前指令
                                // perf: varinfo 惰性计算 (报错路径才查)
-            try_bin_assoc_tm(
+            match try_bin_assoc_tm(
                 state,
                 p1,
                 p2,
@@ -5992,7 +6051,11 @@ impl VmExecutor {
                 tm,
                 Some(opcodes::getarg_a(inst) as usize),
                 None,
-            )?;
+            )? {
+                // LClosure 元方法帧已压 — 见 op_mmbin 注释
+                TmCall::Pushed => return Ok(Next::Reload),
+                TmCall::Done => {}
+            }
         }
         Ok(Next::Continue)
     }
@@ -6025,7 +6088,7 @@ impl VmExecutor {
             // cold path：非 number，需调用 __unm 元方法（需 &mut state，必须 clone）
             let v = Self::read_stack_state(state, b).clone();
             // perf: varinfo 惰性计算 (报错路径才查)
-            try_bin_tm(
+            match try_bin_tm(
                 state,
                 v.clone(),
                 v.clone(),
@@ -6033,7 +6096,13 @@ impl VmExecutor {
                 TagMethod::Unm,
                 Some(opcodes::getarg_b(inst) as usize),
                 Some(opcodes::getarg_b(inst) as usize),
-            )?;
+            )? {
+                // LClosure 元方法帧已压: 结果由帧返回写入 a, state.pc 已指向
+                // 元方法帧第 0 条 — 冷分发收尾 reload_istream 会重载指令流,
+                // 直接交还即可 (不得 pc += 1)
+                TmCall::Pushed => return Ok(()),
+                TmCall::Done => {}
+            }
         }
         state.pc += 1;
         Ok(())
@@ -6062,7 +6131,7 @@ impl VmExecutor {
             let v = Self::read_stack_state(state, b).clone();
             // result = ra (与 C 一致)
             // perf: varinfo 惰性计算 (报错路径才查)
-            try_bin_tm(
+            match try_bin_tm(
                 state,
                 v.clone(),
                 v.clone(),
@@ -6070,7 +6139,11 @@ impl VmExecutor {
                 TagMethod::BNot,
                 Some(opcodes::getarg_b(inst) as usize),
                 Some(opcodes::getarg_b(inst) as usize),
-            )?;
+            )? {
+                // LClosure 元方法帧已压 — 见 op_unm 注释 (不得 pc += 1)
+                TmCall::Pushed => return Ok(()),
+                TmCall::Done => {}
+            }
         }
         state.pc += 1;
         Ok(())
@@ -6917,6 +6990,123 @@ impl VmExecutor {
             state.nextraargs,
         ));
         e
+    }
+
+    /// 元方法直调压帧 — 对应 C 的 `luaT_callTMres` + `luaD_callnoyield`, 但被调者为
+    /// **非变参 Lua 闭包**时不再走 `state.pcall` 嵌套解释器, 而是像 op_call 一样在
+    /// VM 内直接压帧: 帧的 `return_base = res`(结果寄存器)、`return_pc = 被中断
+    /// 指令 + 1`(跳过 OP_MMBIN/MMBIN*/GET*/SELF 等), 由标准 poscall (op_return*)
+    /// 自然完成 continuation —— 帧本身就是 continuation 状态, 无需 PcallProtection。
+    ///
+    /// 语义对齐旧 call_tm_res 路径:
+    /// - CallInfo Meta 条目照旧在调用前压栈 (debug.getinfo/error 层级);
+    /// - yield 穿过元方法: Err(VmError::Yield) 沿同一解释器自然上抛, 帧保留,
+    ///   resume 后元方法体继续 → 返回时标准弹出恢复调用者并跳过被中断指令;
+    /// - 元方法内错误: 自然上抛给外层 pcall (对应 luaD_callnoyield 语义)。
+    ///
+    /// 返回:
+    /// - `Ok(TmCall::Pushed)`: 帧已压入, 调用方返回 `Next::Reload` 交还主循环;
+    /// - `Ok(TmCall::Done)`: 走了旧同步路径 (C 函数元方法等), 结果已写 res 槽。
+    ///
+    /// 调用前提: 调用方 opcode 臂已把 `state.pc` 同步为**被中断指令**的索引
+    /// (savepc 约定), 其 +1 即恢复点。
+    #[inline(never)]
+    pub(crate) fn call_meta_push<'a>(
+        state: &mut LuaState<'a>,
+        f: TValue<'a>,
+        p1: TValue<'a>,
+        p2: TValue<'a>,
+        res: usize,
+        tm: TagMethod,
+    ) -> Result<TmCall, VmError<'a>> {
+        // 非 Lua 闭包 / 变参闭包 (VARARGPREP 会位移 func 槽, 破坏清算边界 =
+        // frame.func 的前提): 走旧 pcall 同步路径
+        let callee = match &f {
+            TValue::LClosure(c) if !c.proto.is_vararg() => c.clone(),
+            _ => {
+                crate::tm::call_tm_res(state, f, p1, p2, res, tm)?;
+                return Ok(TmCall::Done);
+            }
+        };
+        // C 调用深度检查在任何 state 变更前 (失败时无需清算) — 对应 op_call
+        state.n_ccalls = state.n_ccalls.saturating_add(1);
+        let cc = state.get_ccalls();
+        if cc == LUAI_MAXCCALLS || cc >= LUAI_MAXCCALLS * 11 / 10 {
+            state.n_ccalls = state.n_ccalls.saturating_sub(1);
+            let msg = if cc >= LUAI_MAXCCALLS * 11 / 10 {
+                "error in error handling"
+            } else {
+                "C stack overflow"
+            };
+            return Err(VmError::RuntimeError(msg.to_string()));
+        }
+        // 压栈前抬高 live top 到帧上界 (对应 C 的 Protect; 与旧 call_tm_res 一致)
+        state.savestate();
+        let func_idx = state.top;
+        // 压入函数和两个参数 — 按值 move, 免 Rc 引用计数
+        state.push_value(f);
+        state.push_value(p1);
+        state.push_value(p2);
+
+        // CallInfo Meta 条目必须在调用**前**压栈 (元方法体内 debug.getinfo(1)
+        // .namewhat/name 与 error(msg, 2) 层级依赖它; 与旧 call_tm_res 一致)
+        state.call_info.push(crate::state::CallInfoEntry::meta(
+            state.base,
+            state.cur_func(),
+            state.pc, // 调用方已同步为被中断指令
+            tm.event_name(),
+            state.proto_flag,
+            state.nextraargs,
+        ));
+
+        // perf: 一次性取 proto 标量 (与 op_call_lclosure 一致)
+        let fsize = callee.proto.max_stack_size as usize;
+        let proto_num_params = callee.proto.num_params;
+        let nfixparams = proto_num_params as usize;
+        let proto_flag = callee.proto.flag;
+        debug_assert!(!callee.proto.is_vararg(), "变参元方法走旧同步路径");
+
+        // 压帧 — return_base=res / return_pc=被中断指令+1 / num_results=META 哨兵
+        let saved_closure = std::mem::replace(&mut state.closure, Some(callee));
+        state.call_stack.push(CallFrame {
+            func: func_idx,
+            base: state.base,
+            top: func_idx + 1 + fsize,
+            return_base: res,
+            return_pc: state.pc + 1,
+            num_results: META_NUM_RESULTS,
+            num_params: state.num_params,
+            is_vararg: state.is_vararg,
+            proto_flag: state.proto_flag,
+            nextraargs: state.nextraargs,
+            caller_closure: saved_closure,
+            tbc_list: crate::objects::tbc_to_u32(state.tbc_list.take()),
+        });
+
+        state.base = func_idx + 1;
+        state.pc = 0;
+        state.num_params = proto_num_params;
+        state.is_vararg = false;
+        state.proto_flag = proto_flag;
+        state.nextraargs = 0;
+        state.tbc_list = None;
+        state.hook_old_pc = 0;
+        let frame_end = func_idx + 1 + fsize;
+        // 帧上界缓存 (sync_live_top / 冷分发收尾的边界; 与 pcall_impl 一致)
+        state.lua_frame_ceiling = frame_end;
+        if state.stack.len() < frame_end {
+            Self::fast_resize_stack_nil(state, frame_end);
+        }
+        // 补缺失定参 (实参数 nargs=2)
+        for i in 2..nfixparams {
+            state.stack[func_idx + 1 + i] = TValue::Nil(NilKind::Strict);
+        }
+        state.top = frame_end;
+        if state.hook_mask & 1 != 0 {
+            Self::call_hook(state, "call", -1, None, 1, nfixparams as i32)?;
+        }
+        state.pad_frame_scratch();
+        Ok(TmCall::Pushed)
     }
 
     /// op_call 的 LClosure 路径 — Lua 函数调用帧建立。
@@ -8098,7 +8288,12 @@ impl VmExecutor {
             state.n_ccalls = state.n_ccalls.saturating_sub(1);
             // 结果落点 = 调用者槽位（C 的 `ci->func.p - delta`，变参帧下 ≠ `ci->func.p`）
             let return_base = frame.return_base;
-            let num_results = frame.num_results;
+            // 元方法直调帧 (META_NUM_RESULTS): 恒 1 个结果落在 return_base
+            // (调用者寄存器, 可低于本帧 func 槽); return_pc = 被中断指令 + 1,
+            // 上方已按 frame.return_pc 恢复 — 被中断的 MMBIN/GET* 等由此自然
+            // 跳过 (对应 C 的 luaV_finishOp)
+            let is_meta = frame.num_results == META_NUM_RESULTS;
+            let num_results = if is_meta { 1 } else { frame.num_results };
             // 对应 C 的 rethook: 触发 return hook (在 close 之后, 弹出 call_info 之前)
             // C 的 OP_RETURN: luaF_close 先执行 (可能设置 hook), 然后 luaD_poscall 触发 rethook
             if state.hook_mask & 2 != 0 {
@@ -8156,7 +8351,16 @@ impl VmExecutor {
                     state.stack[return_base + i] = TValue::Nil(NilKind::Strict);
                 }
                 // perf: smart_clear_stack 不截断 Vec (当值全 trivial), 避免 write_stack_grow
-                Self::smart_clear_stack(state, return_base + num_results as usize);
+                // 元方法帧: 清算边界 = 本帧 func 槽 (帧恒非变参, func 未被 VARARGPREP
+                // 位移)。return_base 是调用者寄存器, 若按 return_base + nresults 清算
+                // 会把调用者 [return_base+1, func) 区间的活寄存器 (局部变量!) 一起清掉;
+                // 而 [func, ...) 区间 (压入的 f/p1/p2 + 被调帧 scratch) 归本帧所有。
+                let keep = if is_meta {
+                    frame.func
+                } else {
+                    return_base + num_results as usize
+                };
+                Self::smart_clear_stack(state, keep);
             } else {
                 // MULTRET: 截断到实际返回值末尾
                 Self::smart_clear_stack(state, return_base + nresults);
@@ -8251,7 +8455,10 @@ impl VmExecutor {
             state.n_ccalls = state.n_ccalls.saturating_sub(1);
             // 结果落点 = 调用者槽位（C 的 `ci->func.p - delta`，变参帧下 ≠ `ci->func.p`）
             let return_base = frame.return_base;
-            let num_results = frame.num_results;
+            // 元方法直调帧 (META_NUM_RESULTS): 期望 1 个结果 (元方法返回了 0 个值
+            // → 结果槽填 nil), 清算边界 = 本帧 func 槽 (见 op_return_finish 注释)
+            let is_meta = frame.num_results == META_NUM_RESULTS;
+            let num_results = if is_meta { 1 } else { frame.num_results };
             // 对应 C 的 rethook: 触发 return hook (在 close 之后, 弹出 call_info 之前)
             if state.hook_mask & 2 != 0 {
                 // LUA_MASKRET
@@ -8281,7 +8488,8 @@ impl VmExecutor {
                 for i in 0..num_results as usize {
                     state.stack[return_base + i] = TValue::Nil(NilKind::Strict);
                 }
-                Self::smart_clear_stack(state, target_len);
+                let keep = if is_meta { frame.func } else { target_len };
+                Self::smart_clear_stack(state, keep);
             } else {
                 // MULTRET: 必须清除到 return_base (0 个返回值)
                 Self::smart_clear_stack(state, return_base);
@@ -8392,7 +8600,10 @@ impl VmExecutor {
             state.n_ccalls = state.n_ccalls.saturating_sub(1);
             // 结果落点 = 调用者槽位（C 的 `ci->func.p - delta`，变参帧下 ≠ `ci->func.p`）
             let return_base = frame.return_base;
-            let num_results = frame.num_results;
+            // 元方法直调帧 (META_NUM_RESULTS): 恒 1 个结果落在 return_base,
+            // 清算边界 = 本帧 func 槽 (见 op_return_finish 注释)
+            let is_meta = frame.num_results == META_NUM_RESULTS;
+            let num_results = if is_meta { 1 } else { frame.num_results };
             // 对应 C 的 rethook: 触发 return hook (在 close 之后, 弹出 call_info 之前)
             if state.hook_mask & 2 != 0 {
                 // LUA_MASKRET
@@ -8427,7 +8638,9 @@ impl VmExecutor {
                 for i in 1..num_results as usize {
                     state.stack[return_base + i] = TValue::Nil(NilKind::Strict);
                 }
-                Self::smart_clear_stack(state, target_len);
+                // 元方法帧: 清算边界 = 本帧 func 槽 (不得清除调用者活寄存器)
+                let keep = if is_meta { frame.func } else { target_len };
+                Self::smart_clear_stack(state, keep);
             } else {
                 // MULTRET: 把 val 放到 return_base
                 if state.stack.len() < return_base + 1 {
@@ -9452,7 +9665,11 @@ impl VmExecutor {
         key: &TValue<'a>,
         table_source: VarSource,
     ) -> Result<TValue<'a>, VmError<'a>> {
-        Self::table_get_impl(state, table_val, key, table_source, false)
+        // dest=None: 不启用压帧路径 (stdlib 等同步调用方) — Pushed 不可能出现
+        match Self::table_get_impl(state, table_val, key, table_source, false, None)? {
+            GetOutcome::Value(v) => Ok(v),
+            GetOutcome::Pushed => unreachable!("dest=None 时不可能压帧"),
+        }
     }
 
     /// `__index` 慢路径入口: 热路径已对**首个**表做过原始读并确认未命中,
@@ -9464,7 +9681,34 @@ impl VmExecutor {
         key: &TValue<'a>,
         table_source: VarSource,
     ) -> Result<TValue<'a>, VmError<'a>> {
-        Self::table_get_impl(state, table_val, key, table_source, true)
+        match Self::table_get_impl(state, table_val, key, table_source, true, None)? {
+            GetOutcome::Value(v) => Ok(v),
+            GetOutcome::Pushed => unreachable!("dest=None 时不可能压帧"),
+        }
+    }
+
+    /// 表读压帧变体 — `dest` 是结果寄存器: 命中 LClosure `__index` 时在 VM 内
+    /// 直接压帧（`call_meta_push`, return_base=dest、return_pc=被中断指令+1）,
+    /// 结果由标准 poscall 写入 dest; C 函数等仍走旧同步路径（结果也写 dest）。
+    pub(crate) fn table_get_dest<'a>(
+        state: &mut LuaState<'a>,
+        table_val: &TValue<'a>,
+        key: &TValue<'a>,
+        table_source: VarSource,
+        dest: usize,
+    ) -> Result<GetOutcome<'a>, VmError<'a>> {
+        Self::table_get_impl(state, table_val, key, table_source, false, Some(dest))
+    }
+
+    /// [`Self::table_get_missed`] 的压帧变体 — 见 [`Self::table_get_dest`]。
+    pub(crate) fn table_get_missed_dest<'a>(
+        state: &mut LuaState<'a>,
+        table_val: &TValue<'a>,
+        key: &TValue<'a>,
+        table_source: VarSource,
+        dest: usize,
+    ) -> Result<GetOutcome<'a>, VmError<'a>> {
+        Self::table_get_impl(state, table_val, key, table_source, true, Some(dest))
     }
 
     fn table_get_impl<'a>(
@@ -9473,7 +9717,8 @@ impl VmExecutor {
         key: &TValue<'a>,
         table_source: VarSource,
         first_raw_missed: bool,
-    ) -> Result<TValue<'a>, VmError<'a>> {
+        dest: Option<usize>,
+    ) -> Result<GetOutcome<'a>, VmError<'a>> {
         // 对应 C Lua 的 luaV_finishget — 用循环代替递归，加 MAXTAGLOOP 限制
         // 防止 __index 链无限循环（如 a.__index = a 导致栈溢出）
         const MAXTAGLOOP: usize = 2000;
@@ -9498,7 +9743,7 @@ impl VmExecutor {
                         let (val, mt_flag) = t.get_and_metatable(key);
                         if let Some(v) = val {
                             if !matches!(v, TValue::Nil(_)) {
-                                return Ok(v);
+                                return Ok(GetOutcome::Value(v));
                             }
                         }
                         has_mt = mt_flag;
@@ -9533,6 +9778,7 @@ impl VmExecutor {
                                         index_val,
                                         curr.clone(),
                                         key.clone(),
+                                        dest,
                                     );
                                 }
                                 _ => {
@@ -9542,7 +9788,7 @@ impl VmExecutor {
                             }
                         }
                     }
-                    return Ok(TValue::Nil(NilKind::Strict));
+                    return Ok(GetOutcome::Value(TValue::Nil(NilKind::Strict)));
                 }
                 TValue::UserData(ud) => {
                     let mt = ud.metatable.borrow().clone();
@@ -9569,6 +9815,7 @@ impl VmExecutor {
                                     index_val,
                                     curr.clone(),
                                     key.clone(),
+                                    dest,
                                 );
                             }
                             _ => {
@@ -9595,15 +9842,17 @@ impl VmExecutor {
                         if let Some(index_val) = mt.get(&index_key) {
                             match index_val {
                                 TValue::Table(index_table) => {
-                                    return Ok(index_table
-                                        .get(key)
-                                        .unwrap_or(TValue::Nil(NilKind::Strict)));
+                                    return Ok(GetOutcome::Value(
+                                        index_table
+                                            .get(key)
+                                            .unwrap_or(TValue::Nil(NilKind::Strict)),
+                                    ));
                                 }
-                                _ => return Ok(TValue::Nil(NilKind::Strict)),
+                                _ => return Ok(GetOutcome::Value(TValue::Nil(NilKind::Strict))),
                             }
                         }
                     }
-                    return Ok(TValue::Nil(NilKind::Strict));
+                    return Ok(GetOutcome::Value(TValue::Nil(NilKind::Strict)));
                 }
                 other => {
                     core::hint::cold_path();
@@ -9629,6 +9878,7 @@ impl VmExecutor {
                                     f,
                                     curr.clone(),
                                     key.clone(),
+                                    dest,
                                 );
                             }
                             TValue::Table(_) => {
@@ -9663,14 +9913,38 @@ impl VmExecutor {
     }
 
     /// 调用 __index 元方法函数: __index(table, key)
-    /// 使用 call_tm_res 支持 yield (PcallProtection 机制)
+    ///
+    /// `dest = Some(d)`: LClosure 被调者走 VM 内压帧（`call_meta_push`）,
+    /// 结果由帧返回写入 d；C 函数等走旧同步路径（结果也写 d 后取回）。
+    /// `dest = None`: 全部走旧同步路径（stdlib 等同步调用方），结果返回。
     fn call_index_metamethod<'a>(
         state: &mut LuaState<'a>,
         index_fn: TValue<'a>,
         table: TValue<'a>,
         key: TValue<'a>,
-    ) -> Result<TValue<'a>, VmError<'a>> {
-        // res 设为帧上界之上 (call_tm_res 会 push func/p1/p2 在这之后)
+        dest: Option<usize>,
+    ) -> Result<GetOutcome<'a>, VmError<'a>> {
+        if let Some(d) = dest {
+            state.savestate();
+            return match Self::call_meta_push(
+                state,
+                index_fn,
+                table,
+                key,
+                d,
+                crate::tm::TagMethod::Index,
+            )? {
+                TmCall::Pushed => Ok(GetOutcome::Pushed),
+                TmCall::Done => {
+                    // 旧同步路径: 结果已写 d 槽 (call_tm_res(res=d)) — 取回
+                    Ok(GetOutcome::Value(std::mem::replace(
+                        &mut state.stack[d],
+                        TValue::Nil(NilKind::Empty),
+                    )))
+                }
+            };
+        }
+        // 同步路径 (dest=None): res 设为帧上界之上 (call_tm_res 会 push func/p1/p2 在这之后)
         state.savestate();
         let res = state.top;
         // 调用 call_tm_res (支持 yield) — 三个操作数按值 move 进元方法栈槽
@@ -9686,7 +9960,7 @@ impl VmExecutor {
         let result = std::mem::replace(&mut state.stack[res], TValue::Nil(NilKind::Empty));
         // 截断栈，移除临时结果
         state.truncate_live(res);
-        Ok(result)
+        Ok(GetOutcome::Value(result))
     }
 
     /// 设置表字段，支持 `__newindex` 元方法和 yield

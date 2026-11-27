@@ -2230,6 +2230,16 @@ pub struct CallFrame<'a> {
 /// `CallFrame::tbc_list` 的空值哨兵（对应 `None`）。
 pub const NO_TBC: u32 = u32::MAX;
 
+/// `CallFrame::num_results` 的元方法帧哨兵 — 「元方法直调帧」
+/// （[`crate::execute::VmExecutor::call_meta_push`] 压入）：
+/// - 恒 1 个结果，落在 `return_base`（调用者寄存器，可低于本帧 func 槽）；
+/// - `return_pc` = 被中断指令 + 1（标准 poscall 即完成 continuation，
+///   对应 C 的 luaV_finishOp）；
+/// - 返回清算边界 = `frame.func`（帧恒非变参，func 未被 VARARGPREP 位移；
+///   `return_base` 是调用者寄存器，**不得**按 `return_base + 1` 清算，
+///   否则会丢掉调用者 [return_base+1, func) 区间的活寄存器）。
+pub const META_NUM_RESULTS: i32 = -2;
+
 #[inline]
 pub fn tbc_to_u32(v: Option<usize>) -> u32 {
     match v {
