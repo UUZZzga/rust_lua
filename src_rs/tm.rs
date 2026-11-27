@@ -1,4 +1,4 @@
-﻿//! 标签方法 / 元方法 (ltm.h / ltm.cpp → Rust 惯用重写)
+//! 标签方法 / 元方法 (ltm.h / ltm.cpp → Rust 惯用重写)
 //!
 //! 本模块被 vm.rs 和 execute.rs 通过 `use crate::tm::*` 集成使用。
 //!
@@ -59,40 +59,51 @@ pub enum TagMethod {
 
 pub const TM_N: usize = 25;
 
+/// 元方法名（带 "__" 前缀），下标 = `TagMethod as usize`。
+const TM_NAMES: [&str; TM_N] = [
+    "__index",
+    "__newindex",
+    "__gc",
+    "__mode",
+    "__len",
+    "__eq",
+    "__add",
+    "__sub",
+    "__mul",
+    "__mod",
+    "__pow",
+    "__div",
+    "__idiv",
+    "__band",
+    "__bor",
+    "__bxor",
+    "__shl",
+    "__shr",
+    "__unm",
+    "__bnot",
+    "__lt",
+    "__le",
+    "__concat",
+    "__call",
+    "__close",
+];
+
+/// 事件名（无 "__" 前缀）— 对应 C 的 `tmname[tm] + 2`，同样静态直取。
+const TM_EVENT_NAMES: [&str; TM_N] = [
+    "index", "newindex", "gc", "mode", "len", "eq", "add", "sub", "mul", "mod", "pow", "div",
+    "idiv", "band", "bor", "bxor", "shl", "shr", "unm", "bnot", "lt", "le", "concat", "call",
+    "close",
+];
+
 impl TagMethod {
     pub fn name(self) -> &'static str {
-        match self {
-            TagMethod::Index => "__index",
-            TagMethod::NewIndex => "__newindex",
-            TagMethod::Gc => "__gc",
-            TagMethod::Mode => "__mode",
-            TagMethod::Len => "__len",
-            TagMethod::Eq => "__eq",
-            TagMethod::Add => "__add",
-            TagMethod::Sub => "__sub",
-            TagMethod::Mul => "__mul",
-            TagMethod::Mod => "__mod",
-            TagMethod::Pow => "__pow",
-            TagMethod::Div => "__div",
-            TagMethod::IDiv => "__idiv",
-            TagMethod::BAnd => "__band",
-            TagMethod::BOr => "__bor",
-            TagMethod::BXor => "__bxor",
-            TagMethod::Shl => "__shl",
-            TagMethod::Shr => "__shr",
-            TagMethod::Unm => "__unm",
-            TagMethod::BNot => "__bnot",
-            TagMethod::Lt => "__lt",
-            TagMethod::Le => "__le",
-            TagMethod::Concat => "__concat",
-            TagMethod::Call => "__call",
-            TagMethod::Close => "__close",
-        }
+        TM_NAMES[self as usize]
     }
 
-    /// 返回事件名（不含 "__" 前缀）— 对应 C 的 tmname[tm] + 2
+    /// 返回事件名（不含 "__" 前缀）— 对应 C 的 tmname[tm] + 2。
+    /// perf: 静态表直取, 免去字符串切片 + UTF-8 边界检查 (元方法压帧热路径每次都要)。
     pub fn event_name(self) -> &'static str {
-        &self.name()[2..]
+        TM_EVENT_NAMES[self as usize]
     }
 
     pub fn from_u8(n: u8) -> Option<Self> {
@@ -1027,9 +1038,9 @@ fn callbin_tm_push<'a>(
     res: usize,
     tm: TagMethod,
 ) -> Result<TmFound<'a>, VmError<'a>> {
-    // 压 scratch / 走字符串算术快速路径前抬高 live top (对应 C 调用点的 `Protect(p1, p2)`)
-    state.savestate();
     // 先从 p1 查找元方法，再从 p2 查找 — 对应 C 的 callbinTM
+    // perf: 查找本身不碰栈, 无需先 savestate (压帧路径由 call_meta_push 自己抬 top;
+    // 字符串算术/旧 pcall 路径各自在入口抬 top)。
     let tm_val = get_tm_by_obj(&p1, tm, &state.dmt, &state.tmnames)
         .or_else(|| get_tm_by_obj(&p2, tm, &state.dmt, &state.tmnames));
 
@@ -1037,6 +1048,8 @@ fn callbin_tm_push<'a>(
         Some(f) => {
             // 字符串算术元方法占位符 (Integer(0)) — 同 callbin_tm, 同步完成
             if let TValue::Integer(0) = f {
+                // 压 scratch 前抬高 live top (对应 C 调用点的 `Protect(p1, p2)`)
+                state.savestate();
                 if string_arith(state, &p1, &p2, res, tm)? {
                     return Ok(TmFound::Done);
                 }

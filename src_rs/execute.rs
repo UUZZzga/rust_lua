@@ -3311,6 +3311,20 @@ impl VmExecutor {
         state.top = state.frame_top();
     }
 
+    /// 元方法直调帧返回时的栈清算 —— 语义等价 `smart_clear_stack(state, func)`,
+    /// 但 slot `func` 恒为本帧被调闭包 (LClosure, 非 trivial), 故省掉
+    /// `range_all_trivial` 预扫描 (元方法热路径每次返回都要跑一次)。
+    #[inline]
+    fn clear_meta_frame<'a>(state: &mut LuaState<'a>, func: usize, return_base: usize) {
+        #[cfg(feature = "fast_unsafe")]
+        state.clear_nontrivial_range(func, state.top);
+        #[cfg(not(feature = "fast_unsafe"))]
+        state.truncate_live(func);
+        // 结果末尾 = return_base + 1 (元方法恒 1 个结果, 对应 C 的 L->top)
+        state.set_mret_end(return_base + 1);
+        state.top = state.frame_top();
+    }
+
     /// 快速栈扩展 — 用 Nil 填充新槽位, 替代 Vec::resize。
     ///
     /// perf: Vec::resize 在函数调用路径中占 10.52%, 主要开销来自:
@@ -7043,10 +7057,15 @@ impl VmExecutor {
         // 压栈前抬高 live top 到帧上界 (对应 C 的 Protect; 与旧 call_tm_res 一致)
         state.savestate();
         let func_idx = state.top;
-        // 压入函数和两个参数 — 按值 move, 免 Rc 引用计数
-        state.push_value(f);
-        state.push_value(p1);
-        state.push_value(p2);
+        // 三个槽一次就位: 先确保物理长度覆盖 [func_idx, func_idx+3), 再直写 +
+        // 单次 top 更新 —— 省掉 3 次 push_value 的逐次长度检查与 top 递增。
+        if state.stack.len() < func_idx + 3 {
+            Self::fast_resize_stack_nil(state, func_idx + 3);
+        }
+        state.stack[func_idx] = f;
+        state.stack[func_idx + 1] = p1;
+        state.stack[func_idx + 2] = p2;
+        state.top = func_idx + 3;
 
         // CallInfo Meta 条目必须在调用**前**压栈 (元方法体内 debug.getinfo(1)
         // .namewhat/name 与 error(msg, 2) 层级依赖它; 与旧 call_tm_res 一致)
@@ -8355,12 +8374,11 @@ impl VmExecutor {
                 // 位移)。return_base 是调用者寄存器, 若按 return_base + nresults 清算
                 // 会把调用者 [return_base+1, func) 区间的活寄存器 (局部变量!) 一起清掉;
                 // 而 [func, ...) 区间 (压入的 f/p1/p2 + 被调帧 scratch) 归本帧所有。
-                let keep = if is_meta {
-                    frame.func
+                if is_meta {
+                    Self::clear_meta_frame(state, frame.func, return_base);
                 } else {
-                    return_base + num_results as usize
-                };
-                Self::smart_clear_stack(state, keep);
+                    Self::smart_clear_stack(state, return_base + num_results as usize);
+                }
             } else {
                 // MULTRET: 截断到实际返回值末尾
                 Self::smart_clear_stack(state, return_base + nresults);
@@ -8488,8 +8506,12 @@ impl VmExecutor {
                 for i in 0..num_results as usize {
                     state.stack[return_base + i] = TValue::Nil(NilKind::Strict);
                 }
-                let keep = if is_meta { frame.func } else { target_len };
-                Self::smart_clear_stack(state, keep);
+                // 元方法帧: 清算边界 = 本帧 func 槽 (见 clear_meta_frame 注释)
+                if is_meta {
+                    Self::clear_meta_frame(state, frame.func, return_base);
+                } else {
+                    Self::smart_clear_stack(state, target_len);
+                }
             } else {
                 // MULTRET: 必须清除到 return_base (0 个返回值)
                 Self::smart_clear_stack(state, return_base);
@@ -8639,8 +8661,11 @@ impl VmExecutor {
                     state.stack[return_base + i] = TValue::Nil(NilKind::Strict);
                 }
                 // 元方法帧: 清算边界 = 本帧 func 槽 (不得清除调用者活寄存器)
-                let keep = if is_meta { frame.func } else { target_len };
-                Self::smart_clear_stack(state, keep);
+                if is_meta {
+                    Self::clear_meta_frame(state, frame.func, return_base);
+                } else {
+                    Self::smart_clear_stack(state, target_len);
+                }
             } else {
                 // MULTRET: 把 val 放到 return_base
                 if state.stack.len() < return_base + 1 {
@@ -9773,10 +9798,16 @@ impl VmExecutor {
                                 | TValue::BuiltinFn(_)
                                 | TValue::RustClosure(_)
                                 | TValue::LightUserData(_) => {
+                                    // perf: 链式跳转的迭代直接 move 上一跳的
+                                    // index_val; 仅首个迭代 (owned=None) 需 clone。
+                                    let table_owned = match owned {
+                                        Some(v) => v,
+                                        None => curr.clone(),
+                                    };
                                     return Self::call_index_metamethod(
                                         state,
                                         index_val,
-                                        curr.clone(),
+                                        table_owned,
                                         key.clone(),
                                         dest,
                                     );
@@ -9810,10 +9841,15 @@ impl VmExecutor {
                             | TValue::BuiltinFn(_)
                             | TValue::RustClosure(_)
                             | TValue::LightUserData(_) => {
+                                // perf: 同 Table 臂 — 有 owned 就 move, 免一次 clone。
+                                let table_owned = match owned {
+                                    Some(v) => v,
+                                    None => curr.clone(),
+                                };
                                 return Self::call_index_metamethod(
                                     state,
                                     index_val,
-                                    curr.clone(),
+                                    table_owned,
                                     key.clone(),
                                     dest,
                                 );
@@ -9925,7 +9961,7 @@ impl VmExecutor {
         dest: Option<usize>,
     ) -> Result<GetOutcome<'a>, VmError<'a>> {
         if let Some(d) = dest {
-            state.savestate();
+            // perf: 不再先 savestate —— call_meta_push 内部会抬 live top
             return match Self::call_meta_push(
                 state,
                 index_fn,
