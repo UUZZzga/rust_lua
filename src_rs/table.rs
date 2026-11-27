@@ -211,33 +211,41 @@ impl<'a> Table<'a> {
         self.data.borrow().metatable.as_ref().map(|b| (**b).clone())
     }
 
-    /// 按元方法名直查元表 (安全借用版, 零临时 clone) — 返回值引用。
+    /// 按元方法名直查元表 — 返回 owned 值（供 `get_tm_by_obj` 热路径使用）。
     ///
-    /// 用 Ref::filter_map 把 RefCell 借用收窄到命中的值槽上:
-    /// guard 全程持有 (无 unsafe, 无 data_ro), 返回 Ref<TValue>。
-    /// 查找本身用 LuaString 直查公式 (免构造 TValue 键的 Str clone)。
-    /// 未命中 (含 nil tombstone / 无元表) 返回 None。
-    /// 供 get_tm_by_obj 热路径使用。
-    pub fn get_tm_ref(&self, key: &TValue<'a>) -> Option<std::cell::Ref<'_, TValue<'a>>> {
+    /// perf: 元表条目通常极少（每个 TM 一个键），小表直接线性扫描
+    /// `hash_buckets`（跳过 `key_to_bucket` 的 HashMap 哈希探测 + SWAR 分组
+    /// 探测机制，profile 实测此泛型路径 ~70 instr/次）；大于 8 项的表回落
+    /// 泛型哈希查找。命中后 clone 一次值返回（普通 `borrow()` 安全：
+    /// VM 单线程、查找期间无重入点）。
+    pub fn get_tm_owned(&self, key: &TValue<'a>) -> Option<TValue<'a>> {
         let guard = self.data.borrow();
-        let r = std::cell::Ref::filter_map(guard, |d| {
-            use crate::objects::tvalue_fx_hash;
-
-            let ktb = d.key_to_bucket.as_ref()?;
-            let hash = tvalue_fx_hash(key);
-            let (_, idx) = ktb.find(
-                hash,
-                |(k, _)| matches!(k, ks@(TValue::LongStr(_)|TValue::ShortStr(_)) if ks == key),
-            )?;
-            let v = &d.hash_buckets[*idx].1;
-            // C: notm — nil (含 Empty tombstone) 视为无元方法
-            if v.is_nil() {
-                None
-            } else {
-                Some(v)
+        if guard.hash_buckets.len() <= 8 {
+            for (k, v) in guard.hash_buckets.iter() {
+                if matches!(k, ks @ (TValue::LongStr(_) | TValue::ShortStr(_)) if ks == key)
+                    && !v.is_nil()
+                {
+                    return Some(v.clone());
+                }
             }
-        });
-        r.ok()
+            return None;
+        }
+        use crate::objects::tvalue_fx_hash;
+
+        let d: &TableData<'a> = &guard;
+        let ktb = d.key_to_bucket.as_ref()?;
+        let hash = tvalue_fx_hash(key);
+        let (_, idx) = ktb.find(
+            hash,
+            |(k, _)| matches!(k, ks@(TValue::LongStr(_)|TValue::ShortStr(_)) if ks == key),
+        )?;
+        let v = &d.hash_buckets[*idx].1;
+        // C: notm — nil (含 Empty tombstone) 视为无元方法
+        if v.is_nil() {
+            None
+        } else {
+            Some(v.clone())
+        }
     }
 
     /// 设置元表。

@@ -1,4 +1,4 @@
-//! 标签方法 / 元方法 (ltm.h / ltm.cpp → Rust 惯用重写)
+﻿//! 标签方法 / 元方法 (ltm.h / ltm.cpp → Rust 惯用重写)
 //!
 //! 本模块被 vm.rs 和 execute.rs 通过 `use crate::tm::*` 集成使用。
 //!
@@ -321,23 +321,21 @@ pub fn get_tm_by_obj<'a>(
     let key = &tmnames[tm as usize];
     match obj {
         TValue::Table(t) => {
-            // 元表槽: 外层 Table 的 data.metatable 借用 (无 Table clone)
-            let mt_guard =
-                std::cell::Ref::filter_map(t.data.borrow(), |d| d.metatable.as_ref().map(|b| &**b))
-                    .ok()?;
-            let v = mt_guard.get_tm_ref(key)?;
-            Some(v.clone())
+            // perf: 普通 borrow 直查元表槽 + owned 结果 —— 消除 Ref::filter_map
+            // 借用旗标与闭包间接开销（命中后本来就要 clone, Ref 无意义）。
+            // 嵌套借用的是不同 RefCell（或同 RefCell 的多重共享借用），安全。
+            let guard = t.data.borrow();
+            let mt = guard.metatable.as_ref().map(|b| &**b)?;
+            mt.get_tm_owned(key)
         }
         TValue::UserData(u) => {
             let guard = u.metatable.borrow();
             let mt: &Table = guard.as_ref()?;
-            let v = mt.get_tm_ref(key)?;
-            Some(v.clone())
+            mt.get_tm_owned(key)
         }
         other => {
             let mt: &Table = default_mts.get(other.ty())?;
-            let v = mt.get_tm_ref(key)?;
-            Some(v.clone())
+            mt.get_tm_owned(key)
         }
     }
 }
@@ -496,7 +494,7 @@ pub(crate) fn call_tm_res<'a>(
             metamethod_res: res,
             is_close_continuation: false,
             is_pairs_continuation: false,
-            saved_call_stack: Vec::new(),
+            cs_floor: 0,
         });
     let mm_protection_idx = state.pcall_protection_stack.len() - 1;
 
@@ -676,7 +674,7 @@ pub(crate) fn call_tm<'a>(
             metamethod_res: func_idx, // 不使用 (0 个返回值)
             is_close_continuation: false,
             is_pairs_continuation: false,
-            saved_call_stack: Vec::new(),
+            cs_floor: 0,
         });
     let mm_protection_idx = state.pcall_protection_stack.len() - 1;
 
@@ -854,7 +852,7 @@ fn call_close_method_inner<'a>(
             metamethod_res: 0,
             is_close_continuation: true,
             is_pairs_continuation: false,
-            saved_call_stack: Vec::new(),
+            cs_floor: 0,
         });
 
     // 对应 C 的 callclosemethod: yy=1 用 luaD_call (可 yield), yy=0 用 luaD_callnoyield

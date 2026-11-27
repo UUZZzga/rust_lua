@@ -1515,12 +1515,13 @@ impl VmExecutor {
                 );
                 // ci/base 一致性断言: 当前帧记录 (call_stack 栈顶, C 的 L->ci) 的
                 // `func` 必须与 state.base 同步 —— `func + 1 == base`（VARARGPREP 位移
-                // 二者一体调整）。入口帧（pcall / 协程体）没有记录 → 栈为空。
+                // 二者一体调整）。入口帧（pcall / 协程体）没有记录 → 以 barrier 触底。
                 debug_assert!(
-                    state
-                        .call_stack
-                        .last()
-                        .map_or(true, |f| f.func + 1 == state.base),
+                    state.call_stack.len() <= state.call_stack_barrier()
+                        || state
+                            .call_stack
+                            .last()
+                            .map_or(true, |f| f.func + 1 == state.base),
                     "ci/base diverged: op={:?} pc={} base={} ci={:?}",
                     op,
                     cur_pc!(),
@@ -2380,16 +2381,20 @@ impl VmExecutor {
                 // 当 error 穿过被 yield 的 pcall 时，需要关闭 pcall 保护范围内的
                 // TBC 变量。使用 pcall 调用者（如 foo）的 closure_upvals/tbc_list/open_upval
                 // (从 call_stack 栈顶 CallFrame 获取，保存的是 pcall 调用者的值)。
-                // 若 call_stack 为空（inner_func 直接 error），使用当前 state 的上下文。
+                // 若 barrier 触底（无内层帧，inner_func 直接 error），使用当前 state 的上下文。
                 let pp_func_idx = state.pcall_protection_stack.last().unwrap().func_idx;
-                let saved_ctx = if let Some(frame) = state.call_stack.last().cloned() {
-                    let saved_cu =
-                        std::mem::replace(&mut state.closure, frame.caller_closure.clone());
-                    let saved_tl = std::mem::replace(
-                        &mut state.tbc_list,
-                        crate::objects::tbc_from_u32(frame.tbc_list),
-                    );
-                    Some((saved_cu, saved_tl))
+                let saved_ctx = if state.call_stack.len() > state.call_stack_barrier() {
+                    if let Some(frame) = state.call_stack.last().cloned() {
+                        let saved_cu =
+                            std::mem::replace(&mut state.closure, frame.caller_closure.clone());
+                        let saved_tl = std::mem::replace(
+                            &mut state.tbc_list,
+                            crate::objects::tbc_from_u32(frame.tbc_list),
+                        );
+                        Some((saved_cu, saved_tl))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
@@ -2423,6 +2428,9 @@ impl VmExecutor {
                 // 使 error 传播到 state.pcall，而非被外层 PcallProtection 捕获。
                 // 遇到 is_close_continuation 时也 break：close continuation 的 error
                 // 已在上面的分支处理。
+                // floor 化: 记录最外层被弹出的 filled 保护的地板 —— 它就是恢复
+                // 执行点（该 pcall 的调用者）的 call_stack 地板, 内层残留帧全部截掉。
+                let mut last_popped_cs_floor: Option<usize> = None;
                 while let Some(protection) = state.pcall_protection_stack.last() {
                     if !protection.saved_filled {
                         break;
@@ -2431,6 +2439,7 @@ impl VmExecutor {
                         break;
                     }
                     let protection = state.pcall_protection_stack.pop().unwrap();
+                    last_popped_cs_floor = Some(protection.cs_floor);
                     // 恢复 pcall 调用者的执行上下文
                     state.base = protection.saved_base;
                     state.recompute_lua_frame_ceiling();
@@ -2511,18 +2520,22 @@ impl VmExecutor {
                         };
                     }
                 }
-                // 所有 PcallProtection 处理完毕，清空 call_stack
-                // 对应 C Lua 的 longjmp 跳过所有 CallInfo，回到 pcall 调用前的状态
-                // pcall 处理路径只在协程场景下被触发（PP1.saved_filled=true，即 yield 穿过 pcall），
-                // call_stack 中的帧是被中断的调用帧，pcall 捕获 error 后不再需要
+                // 所有 PcallProtection 处理完毕，按最外层 filled 保护的地板截断
+                // call_stack（对应 C Lua 的 longjmp 跳过所有 CallInfo，回到 pcall
+                // 调用前的状态）。pcall 处理路径只在协程场景下被触发
+                // （PP1.saved_filled=true，即 yield 穿过 pcall），地板之上的帧是
+                // 被中断的内层调用帧，pcall 捕获 error 后不再需要；地板之下的帧
+                // （pcall 调用者的链）必须保留 —— 后续 op_return 还要正常弹出。
                 //
-                // 清空前物化错误快照：此刻 call_stack 仍完整，Lua 薄条目的 frame_idx
-                // 尚可解析（clear 之后物化会得到全空壳条目，stack overflow 的
+                // 截断前物化错误快照：此刻 call_stack 仍完整，Lua 薄条目的 frame_idx
+                // 尚可解析（截断之后物化会得到全空壳条目，stack overflow 的
                 // traceback 因此全部退化为 "?: in function <?:0>"）。
                 // pcall 错误路径（state.rs）优先复用该快照。
                 let snap = state.materialize_call_info();
                 state.last_error_call_info = Some(snap);
-                state.call_stack.clear();
+                if let Some(floor) = last_popped_cs_floor {
+                    state.call_stack.truncate(floor);
+                }
                 break;
             }
             Self::build_traceback(state, &current_error);
@@ -3938,10 +3951,10 @@ impl VmExecutor {
         state.nextraargs = protection.saved_nextraargs;
         state.closure = protection.saved_closure;
         state.tbc_list = protection.saved_tbc_list;
-        // 恢复外层 call_stack 帧（yield 时保存到 PcallProtection.saved_call_stack）
-        // 这些帧持有 Rc 引用（code/constants/protos 等），恢复后 pcall 调用者
-        // 继续执行/返回时能正确 pop 帧恢复调用者的 state。
-        state.call_stack = protection.saved_call_stack;
+        // floor 化: 外层帧从未离开 call_stack（索引 < cs_floor），按地板截掉
+        // 被保护执行期间压入的内层帧即可 —— 零搬运。内层帧持有 Rc 引用随
+        // CallFrame 丢弃正常减计数。
+        state.call_stack.truncate(protection.cs_floor);
         // open_upval is now global, not saved/restored per-function
 
         // push true + 返回值，按 nresults 调整栈
@@ -7823,8 +7836,12 @@ impl VmExecutor {
                 // 对应 C 的 luaD_pretailcall: `ci->top.p = func + 1 + fsize`
                 // 本帧复用（`ci.func` 即 func_slot 不变，只有 top 随新函数重算），
                 // VARARGPREP 之后再按 totalargs 上移。
-                if let Some(ci) = state.call_stack.last_mut() {
-                    ci.top = func_slot + 1 + fsize;
+                // floor 化: pcall 窗口内的入口帧（尾调发生在被保护函数自身）没有
+                // ci 记录 — last() 是外层帧, 不得改写其 top。
+                if state.call_stack.len() > state.call_stack_barrier() {
+                    if let Some(ci) = state.call_stack.last_mut() {
+                        ci.top = func_slot + 1 + fsize;
+                    }
                 }
                 state.lua_frame_ceiling = func_slot + 1 + fsize;
 
@@ -8069,7 +8086,14 @@ impl VmExecutor {
                 }
             }
         }
-        if let Some(frame) = state.call_stack.pop() {
+        // floor 化 pop 守卫: pcall 窗口内触底（入口帧返回）不弹外层帧 ——
+        // 外层帧归调用者链所有, 由 finish_pcall_return / pcall_impl 按 floor 截断。
+        let popped = if state.call_stack.len() > state.call_stack_barrier() {
+            state.call_stack.pop()
+        } else {
+            None
+        };
+        if let Some(frame) = popped {
             // 递减 C 调用深度 (对应 op_call 中递增的 n_ccalls)
             state.n_ccalls = state.n_ccalls.saturating_sub(1);
             // 结果落点 = 调用者槽位（C 的 `ci->func.p - delta`，变参帧下 ≠ `ci->func.p`）
@@ -8216,7 +8240,13 @@ impl VmExecutor {
                 }
             }
         }
-        if let Some(frame) = state.call_stack.pop() {
+        // floor 化 pop 守卫 (见 op_return_finish)
+        let popped = if state.call_stack.len() > state.call_stack_barrier() {
+            state.call_stack.pop()
+        } else {
+            None
+        };
+        if let Some(frame) = popped {
             // 递减 C 调用深度 (对应 op_call 中递增的 n_ccalls)
             state.n_ccalls = state.n_ccalls.saturating_sub(1);
             // 结果落点 = 调用者槽位（C 的 `ci->func.p - delta`，变参帧下 ≠ `ci->func.p`）
@@ -8351,7 +8381,13 @@ impl VmExecutor {
                 }
             }
         }
-        if let Some(frame) = state.call_stack.pop() {
+        // floor 化 pop 守卫 (见 op_return_finish)
+        let popped = if state.call_stack.len() > state.call_stack_barrier() {
+            state.call_stack.pop()
+        } else {
+            None
+        };
+        if let Some(frame) = popped {
             // 递减 C 调用深度 (对应 op_call 中递增的 n_ccalls)
             state.n_ccalls = state.n_ccalls.saturating_sub(1);
             // 结果落点 = 调用者槽位（C 的 `ci->func.p - delta`，变参帧下 ≠ `ci->func.p`）

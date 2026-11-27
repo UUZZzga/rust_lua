@@ -121,11 +121,13 @@ pub struct PcallProtection<'a> {
     /// continuation（对应 C Lua 的 lua_callk + pairscont 机制）
     /// 与普通 pcall continuation 区别: 不 push true 前缀，直接返回 __pairs 的结果
     pub is_pairs_continuation: bool,
-    /// yield 穿越 pcall 时保存的外层 call_stack 帧 — 由 finish_pcall_return 恢复
-    /// 这些帧持有 Rc 引用（code/constants/protos 等），丢弃会导致悬空指针。
-    /// 不合并到 call_stack: 否则 resume 后内层帧 pop 完会错误 pop 外层帧，
-    /// 导致 state.exec.base 跳过 pcall 的 func_idx+1。
-    pub saved_call_stack: Vec<crate::objects::CallFrame<'a>>,
+    /// 本保护的 call_stack 地板（floor 化设计）— `pcall_impl` 执行受保护函数体前
+    /// 写入 = 当时的 `call_stack.len()`。窗口内 `op_return` 的 pop 与 `cur_func`
+    /// 等 `last()` 读取均以 [`LuaState::call_stack_barrier`]（= 栈顶保护的
+    /// `cs_floor`）为界：内层帧 pop 到地板即停（入口帧返回），外层帧永不被
+    /// 误 pop。错误/continuation 路径按它 `truncate`，取代旧的整栈换出
+    /// （`saved_call_stack`）方案 —— 外层帧始终留在 `call_stack`，索引零搬运。
+    pub cs_floor: usize,
 }
 
 pub struct GlobalShared<'a> {
@@ -804,7 +806,25 @@ impl<'a> LuaState<'a> {
     /// 「调用点现场」，栈空即表示当前是入口帧。
     #[inline(always)]
     pub fn current_ci(&self) -> Option<&crate::objects::CallFrame<'a>> {
-        self.call_stack.last()
+        // floor 化: pcall 窗口内无内层帧时 last() 是外层帧 — 以 barrier 为界回退 None
+        if self.call_stack.len() > self.call_stack_barrier() {
+            self.call_stack.last()
+        } else {
+            None
+        }
+    }
+
+    /// call_stack 的弹出屏障（floor 化设计）— 栈顶 PcallProtection 的
+    /// [`PcallProtection::cs_floor`]，无保护时为 0。
+    ///
+    /// `pcall_impl` 执行受保护函数体前把当时 `call_stack.len()` 写入壳的
+    /// `cs_floor`；此后窗口内 `op_return` 的 pop、`cur_func`/`current_ci` 的
+    /// `last()` 读取均以此为界 —— 内层帧（索引 ≥ floor）正常弹出，触底即停
+    /// （入口帧返回走 continuation 分支），外层帧（索引 < floor）永不被误 pop。
+    /// 替代旧的「整栈换出 + saved_call_stack 恢复」方案。
+    #[inline(always)]
+    pub fn call_stack_barrier(&self) -> usize {
+        self.pcall_protection_stack.last().map_or(0, |p| p.cs_floor)
     }
 
     /// 当前帧的函数槽（C 的 `ci->func.p`）。
@@ -815,9 +835,11 @@ impl<'a> LuaState<'a> {
     /// （入口帧由 Rust 侧设定 base，无独立 ci）。
     #[inline(always)]
     pub fn cur_func(&self) -> usize {
-        match self.call_stack.last() {
-            Some(f) => f.func,
-            None => self.base.saturating_sub(1),
+        // floor 化: pcall 窗口内无内层帧时 last() 是外层帧 — 以 barrier 为界回退 base-1
+        if self.call_stack.len() > self.call_stack_barrier() {
+            self.call_stack.last().unwrap().func
+        } else {
+            self.base.saturating_sub(1)
         }
     }
 
@@ -877,7 +899,6 @@ impl<'a> LuaState<'a> {
     }
 
     /// 当前帧寄存器写边界 (exclusive) —— 保守取 `anchor + MAX_FSTACK + 1`。
-    ///
     /// anchor = 帧基址 (base 有效时) 否则栈长: 保证覆盖「base + 寄存器号」形式的写
     /// (寄存器号上界 = MAX_FSTACK) 与「栈顶追加」形式的写 (idx == len)。取寄存器上界
     /// 而非 proto.max_stack_size 是**刻意保守**: 变参前导/展开、C 侧构造的帧都可能写到
@@ -1788,6 +1809,7 @@ impl<'a> LuaState<'a> {
                 if need_shield {
                     self.pcall_protection_stack
                         .push(crate::state::PcallProtection {
+                            cs_floor: 0,
                             saved_base: 0,
                             saved_pc: 0,
                             saved_mret_end: 0,
@@ -1806,41 +1828,68 @@ impl<'a> LuaState<'a> {
                             metamethod_res: 0,
                             is_close_continuation: false,
                             is_pairs_continuation: false,
-                            saved_call_stack: Vec::new(),
                         });
                 }
 
-                // 临时保存并清空 call_stack，避免 execute_loop 中的 op_return
-                // 错误地 pop 外层调用帧（如 checkerror 的帧）。
-                // state.pcall 的 LClosure 分支不 push call_stack（不像 op_call），
-                // 所以 call_stack 中的帧是外层调用的，不应被内层函数的 op_return 使用。
-                // 对应 C Lua 中 state.pcall 创建新的 CallInfo，与外层 CallInfo 链隔离。
-                // 入口帧本身没有 ci 记录：它的身份由 state.base 决定
-                // （「当前帧函数槽」见 `LuaState::cur_func`）。
-                // 注意: 不清空 call_info，因为 op_return 只在 call_stack.pop() 成功时
-                // 才 pop call_info（call_stack 为空时不会 pop），且调用者（如 call_hook）
-                // 可能已 push call_info 供 debug.getinfo 使用。
-                // 窗口前的 Lua 薄条目 frame_idx 指向即将被换出的 call_stack 帧。
-                // 窗口内（受保护函数体执行期间，如 __close 元方法经 call_close_method
-                // 的 state.pcall 调用）getinfo/traceback 若读取外层条目，帧不可达
-                // ——先物化为自包含 Full 条目（帧此刻仍存活，快照即实时派生值）。
-                for e in self.call_info[..saved_call_info_len].iter_mut() {
-                    if matches!(e, CallInfoEntry::Lua { .. }) {
-                        *e = CallInfoEntry::Full(Box::new(materialize_entry_slices(
-                            &self.stack,
-                            &self.call_stack,
-                            e,
-                        )));
-                    }
+                // floor 化（替代旧的「整栈换出 + saved_call_stack 恢复」）：
+                // 记录本窗口的 call_stack 地板到壳的 cs_floor。执行期间外层帧
+                // （索引 < floor）始终留在 call_stack，内层帧在其上重建；op_return
+                // 的 pop 与 last() 读取以 [`Self::call_stack_barrier`] 为界，触底即停。
+                // 成功路径帧已被 pop 守卫停住（零搬运零分配）；错误/continuation
+                // 路径按 floor truncate。
+                // C API 直调 lua_pcall（无 call_pcall 壳）时压入一个瞬态壳 —— 否则
+                // barrier 为 0，受保护函数返回时会误 pop 调用者链的帧。瞬态壳在
+                // execute_loop 返回后立即弹出（见下方 pop 点），不参与 continuation。
+                let pushed_transient = self.pcall_protection_stack.is_empty();
+                let shell_existed = !pushed_transient;
+                let prev_cs_floor = self.pcall_protection_stack.last().map_or(0, |p| p.cs_floor);
+                let cs_floor = self.call_stack.len();
+                if shell_existed {
+                    self.pcall_protection_stack.last_mut().unwrap().cs_floor = cs_floor;
+                } else {
+                    self.pcall_protection_stack
+                        .push(crate::state::PcallProtection {
+                            cs_floor,
+                            saved_base: 0,
+                            saved_pc: 0,
+                            saved_mret_end: 0,
+                            saved_num_params: 0,
+                            saved_is_vararg: false,
+                            saved_proto_flag: 0,
+                            saved_nextraargs: 0,
+                            saved_closure: None,
+                            saved_tbc_list: None,
+                            func_idx: 0,
+                            logical_top: 0,
+                            nresults: 0,
+                            pcall_kind: crate::state::PcallKind::Pcall,
+                            saved_filled: false,
+                            is_metamethod: false,
+                            metamethod_res: 0,
+                            is_close_continuation: false,
+                            is_pairs_continuation: false,
+                        });
                 }
-                let saved_call_stack_frames = std::mem::take(&mut self.call_stack);
 
                 // 执行受保护函数体。这里同时是**内存错误的保护边界**:
                 // 没有错误通道的分配点(帧入口栈扩容等)以 panic/longjmp 抛出
                 // MemoryErrorPanic(对应 C 的 luaD_throw(L, LUA_ERRMEM)),
                 // 在此转换回 VmError::MemoryError —— 错误对象取自预注册的
                 // memerrmsg, 转换过程零分配。
-                let result = {
+                //
+                // perf (floor 化铺路): meta_prepared = 元方法调用入口
+                // (pcall_after_meta_entry) —— 跳过 setjmp/trampoline/catch_unwind
+                // 保护边界, 直接跑 execute_loop。对齐 C 的 luaT_callTMres →
+                // luaD_callnoyield: 元方法帧**不是**独立的保护点, 元方法内的
+                // Lua 错误本就以 Err 穿过本帧传播到外层 pcall; 内存错误
+                // (MemoryErrorPanic/longjmp) 同样逃逸到**外层**保护点 ——
+                // floor 化保证外层错误路径按其自身 cs_floor truncate,
+                // 本窗口遗留的内层帧/未平衡计数一并被外层恢复代码清算
+                // (saved_closure 等本地 Rc 泄漏到 arena 释放, 无悬垂)。
+                // 最外层 (无外层保护时) 由 C API 入口的 pcall 兜底。
+                let result = if meta_prepared {
+                    VmExecutor::execute_loop(self)
+                } else {
                     #[cfg(not(lua_use_longjmp))]
                     {
                         let state_ptr: *mut LuaState = self;
@@ -1917,85 +1966,25 @@ impl<'a> LuaState<'a> {
                     }
                 };
 
-                // 恢复 call_stack（execute_loop 可能修改了它）
-                // 非 yield 路径: execute_loop 中的 op_return 应该走 else 分支（call_stack 为空），
-                //   不会 pop 帧也不会 push 帧，call_stack 仍为空。
-                // yield 路径: execute_loop 返回 Yield，call_stack 可能有残留（被中断的内层调用），
-                //   只保留这些内层帧供协程恢复时使用。
-                //   外层帧（saved_call_stack_frames）保存到 PcallProtection.saved_call_stack，
-                //   由 finish_pcall_return 恢复。不合并到 call_stack: 否则 resume 后内层帧 pop 完
-                //   会错误 pop 外层帧，导致 state.exec.base 跳过 pcall 的 func_idx+1。
-                //   外层帧持有 Rc 引用（code/constants/protos 等），必须保存以防释放后悬空指针。
-                // 错误路径: 在 1912 行用外层栈覆盖 call_stack 之前，物化错误快照。
-                // 内层 Lua 薄条目的 frame_idx 指向内层栈（g/auxy 等被保护函数的帧），
-                // 覆盖后全部失效 —— stack overflow 的 traceback 会退化为 "?: in function <?:0>"。
-                // 协程路径（execute_loop 错误处理）可能已存快照，不覆盖。
-                // 先截断到 saved_call_info_len 再物化（对齐 C 的 L->ci = old_ci）:
+                // floor 化: call_stack 不再换出 — 外层帧（索引 < cs_floor）始终留在
+                // call_stack 且索引稳定，窗口前的 Lua 薄条目 frame_idx 持续有效，
+                // 无需任何物化/恢复/合并操作。
+                // 错误路径: 在下方按 floor truncate 之前物化错误快照。
+                // 内层 Lua 薄条目的 frame_idx 指向受保护执行期间压入的帧，
+                // truncate 后失效 —— stack overflow 的 traceback 会退化为
+                // "?: in function <?:0>"。协程路径（execute_loop 错误处理）可能已存
+                // 快照，不覆盖。
+                // 先物化再截断（对齐 C 的 L->ci = old_ci）:
                 // 错误展开中 C 函数（如 error()）推入的条目不应进入快照 —— C 5.5 的
                 // C 函数调用不产生 CallInfo，traceback 不显示 error 帧；若残留进快照，
                 // 会被外层 pcall（xpcall 等）take 复用，导致 c_chain 判定错位、
                 // 元方法帧（"in metamethod 'newindex'"）被当作当前 Lua 帧而丢失。
                 if result.is_err() && self.last_error_call_info.is_none() {
                     // 物化全量 call_info（对齐基线 clone 全量语义）：此刻 call_stack
-                    // 尚未被外层栈覆盖（1930 行），内层 Lua 薄条目的 frame_idx 仍可解析。
-                    // 不可先 truncate 到 saved_call_info_len —— 会把栈溢出等场景下
-                    // 大量内层 Lua 帧删掉，traceback 退化为 "?: in function <?:0>"。
+                    // 尚未 truncate，所有帧仍可解析。
                     // 错误展开期间 C 函数（error() 等）推入的条目也保留在快照中
                     // （与基线一致），由 traceback 消费端的 c_chain 判定处理。
                     self.last_error_call_info = Some(self.materialize_call_info());
-                }
-                if !matches!(&result, Ok(VmResult::Yield { .. })) {
-                    self.call_stack = saved_call_stack_frames;
-                } else {
-                    // yield: 外层帧即将移出 self.call_stack（保存到 PcallProtection）。
-                    // call_info 中引用外层帧的 Lua 薄条目（frame_idx 相对外层向量）
-                    // 必须先物化为自包含条目，否则挂起期间/恢复后 frame_idx 与
-                    // self.call_stack（只剩内层帧）错位。
-                    // 内层条目引用 self.call_stack 的内层帧，索引仍然有效，保持薄条目。
-                    for e in self.call_info[..saved_call_info_len].iter_mut() {
-                        if matches!(e, CallInfoEntry::Lua { .. }) {
-                            *e = CallInfoEntry::Full(Box::new(materialize_entry_slices(
-                                &self.stack,
-                                &saved_call_stack_frames,
-                                e,
-                            )));
-                        }
-                    }
-                    // 只保留内层残留帧（被中断的调用），外层帧保存到 PcallProtection
-                    let pp_len = self.pcall_protection_stack.len();
-                    // 向下查找第一个未填充的 PcallProtection（与下方 saved_filled 更新逻辑一致）
-                    let target_idx = if pp_len > 0 {
-                        (0..pp_len)
-                            .rev()
-                            .find(|&i| !self.pcall_protection_stack[i].saved_filled)
-                    } else {
-                        None
-                    };
-                    match target_idx {
-                        Some(idx) => {
-                            self.pcall_protection_stack[idx].saved_call_stack =
-                                saved_call_stack_frames;
-                            // remaining（内层帧）已在 self.call_stack 中
-                        }
-                        None => {
-                            // fallback: 找不到目标 PcallProtection（嵌套 yield 场景）时，
-                            // 合并到 call_stack 以避免丢弃 Rc 引用导致悬空指针。
-                            // 合并会平移内层帧索引 —— 内层薄条目也须物化。
-                            for e in self.call_info[saved_call_info_len..].iter_mut() {
-                                if matches!(e, CallInfoEntry::Lua { .. }) {
-                                    *e = CallInfoEntry::Full(Box::new(materialize_entry_slices(
-                                        &self.stack,
-                                        &self.call_stack,
-                                        e,
-                                    )));
-                                }
-                            }
-                            let remaining = std::mem::take(&mut self.call_stack);
-                            let mut combined = saved_call_stack_frames;
-                            combined.extend(remaining);
-                            self.call_stack = combined;
-                        }
-                    }
                 }
                 // 恢复 n_ccalls (对应 C 的 decnny / longjmp 恢复 ci->nCcalls)。
                 // 非 yield 路径下恢复到 pcall 调用前的值:
@@ -2009,6 +1998,13 @@ impl<'a> LuaState<'a> {
                 // pop shield: shield 只在 execute_loop 执行期间需要
                 // (yield 路径下也需先 pop shield，再更新顶部 PcallProtection)
                 if need_shield {
+                    self.pcall_protection_stack.pop();
+                }
+                // 瞬态壳（C API 直调 lua_pcall）只在受保护执行期间提供 barrier，
+                // 所有出口（含 yield）立即消费 —— 它不参与 yield 填充/continuation
+                // （C 调用者的 lua_pcall 无法续接，yield 由协程恢复机制直接接管，
+                // 对齐旧代码「无壳 → 无填充 → 恢复机制返回结果」的行为）。
+                if pushed_transient {
                     self.pcall_protection_stack.pop();
                 }
 
@@ -2204,6 +2200,20 @@ impl<'a> LuaState<'a> {
                     self.tbc_list = saved_tbc_list;
                     self.lua_frame_ceiling = saved_ceiling;
                     self.mret_end = saved_mret_end;
+                    // floor 化: 把 call_stack 截回本窗口地板（成功路径 op_return 的
+                    // pop 守卫已停在地板上, 此处是 no-op; 错误路径清除内层残留帧）。
+                    // yield/close_yield 路径保留帧（协程恢复后继续使用）。
+                    self.call_stack.truncate(cs_floor);
+                    // 复用外层壳的嵌套 pcall 把 cs_floor 还原, 防止 floor 串位污染
+                    // 外层窗口。瞬态壳已在上方弹出; shield 亦已弹出, 此处 last() 是
+                    // 外层壳或 filled 保护 —— filled 保护不改写。
+                    if !pushed_transient {
+                        if let Some(shell) = self.pcall_protection_stack.last_mut() {
+                            if !shell.saved_filled {
+                                shell.cs_floor = prev_cs_floor;
+                            }
+                        }
+                    }
                 }
 
                 match result {

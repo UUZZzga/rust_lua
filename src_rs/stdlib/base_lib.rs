@@ -1,4 +1,4 @@
-//! 基础库 (lbaselib.cpp → Rust)
+﻿//! 基础库 (lbaselib.cpp → Rust)
 //!
 //! 对应 C 源码: lbaselib.cpp
 //!
@@ -495,7 +495,7 @@ pub(crate) fn call_pcall<'a>(
             metamethod_res: 0,
             is_close_continuation: false,
             is_pairs_continuation: false,
-            saved_call_stack: Vec::new(),
+            cs_floor: 0,
         });
     let pcall_protection_idx = state.pcall_protection_stack.len() - 1;
 
@@ -675,21 +675,27 @@ fn lua_l_where<'a>(state: &LuaState<'a>, level: usize) -> String {
         // 当前不在 C 函数中, 返回 state.base/pc 代表的 Lua 函数位置
         get_current_lua_func_position(state)
     } else {
-        let cs_len = state.call_stack.len();
-        // 第 k 层帧 (k >= 2) 的**身份**在 call_stack[cs_len - k] —— 进入该帧时压入的
+        // floor 化: call_stack 含外层窗口帧（索引 < barrier），层级回溯须以当前
+        // pcall 窗口为基线（对齐旧「栈换出后 call_stack 即窗口」的语义）。
+        let barrier = state.call_stack_barrier();
+        let cs_len = state.call_stack.len() - barrier;
+        // 第 k 层帧 (k >= 2) 的**身份**在窗口内 call_stack[barrier + cs_len - k] —— 进入该帧时压入的
         // 记录里的 `func`（C 的 ci->func.p）；它**当前所在位置**则在更内一层记录的
         // `return_pc` 里（该帧调用下一层处的下一条 pc，C 的 ci->u.l.savedpc）。
         // 最外层记录之上的调用者没有自己的记录，用它快照里的调用者基址反推 func。
         let (func_slot, call_pc) = match cs_len.checked_sub(level) {
-            Some(i) => (
-                state.call_stack[i].func,
-                state
-                    .call_stack
-                    .get(i + 1)
-                    .map_or(0, |f| f.return_pc.saturating_sub(1)),
-            ),
+            Some(rel) => {
+                let i = barrier + rel;
+                (
+                    state.call_stack[i].func,
+                    state
+                        .call_stack
+                        .get(i + 1)
+                        .map_or(0, |f| f.return_pc.saturating_sub(1)),
+                )
+            }
             None if level == cs_len + 1 => {
-                let r0 = match state.call_stack.first() {
+                let r0 = match state.call_stack.get(barrier) {
                     Some(f) => f,
                     None => return String::new(),
                 };
@@ -1248,7 +1254,7 @@ fn call_pairs<'a>(
                 metamethod_res: 0,
                 is_close_continuation: false,
                 is_pairs_continuation: true,
-                saved_call_stack: Vec::new(),
+                cs_floor: 0,
             });
 
         // state.pcall(1, 4): 1 arg (t), 4 results
@@ -1352,7 +1358,7 @@ pub(crate) fn call_xpcall<'a>(
             metamethod_res: 0,
             is_close_continuation: false,
             is_pairs_continuation: false,
-            saved_call_stack: Vec::new(),
+            cs_floor: 0,
         });
     let xpcall_protection_idx = state.pcall_protection_stack.len() - 1;
 
