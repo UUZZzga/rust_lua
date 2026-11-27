@@ -416,10 +416,12 @@ fn push_meta_call_entry<'a>(
 }
 
 pub(crate) fn call_tm_res<'a>(
+    // perf: 三个操作数按值接收 —— 调用方若已持有 owned 值 (如 call_index_metamethod)
+    // 可直接 move 进栈槽, 省掉「先 clone 进来再 clone 进栈」的两轮 Rc 引用计数。
     state: &mut LuaState<'a>,
-    f: &TValue<'a>,
-    p1: &TValue<'a>,
-    p2: &TValue<'a>,
+    f: TValue<'a>,
+    p1: TValue<'a>,
+    p2: TValue<'a>,
     res: usize,
     tm: TagMethod,
 ) -> Result<(), VmError<'a>> {
@@ -434,10 +436,12 @@ pub(crate) fn call_tm_res<'a>(
     // 压 scratch 前抬高 live top 到帧上界 (对应 C 的 `Protect(luaT_callTMres)`)
     state.savestate();
     let func_idx = state.top;
-    // 压入函数和两个参数 (对应 C 的 setobj2s)
-    state.push_value(f.clone());
-    state.push_value(p1.clone());
-    state.push_value(p2.clone());
+    // 被调者是否为 Lua 闭包 —— 必须在 move 进栈槽之前判定
+    let is_lua = matches!(f, TValue::LClosure(_));
+    // 压入函数和两个参数 (对应 C 的 setobj2s) — 按值 move, 不再 clone
+    state.push_value(f);
+    state.push_value(p1);
+    state.push_value(p2);
 
     // 推入 CallInfoEntry — 对应 C 的 luaD_callnoyield 推入 CallInfo
     // name = 事件名 (如 "index", "add"), namewhat = "metamethod"
@@ -447,17 +451,11 @@ pub(crate) fn call_tm_res<'a>(
     let caller_is_vararg = state.is_vararg;
     let caller_proto_flag = state.proto_flag;
     let caller_nextraargs = state.nextraargs;
-    let caller_closure = state.closure.clone();
+    // perf: 不再预先 clone 调用者闭包 —— 非 yield 路径由 pcall_impl 自行恢复,
+    // 本保护结构里的 saved_closure 只在 yield 穿出时才被 consumer 读取,
+    // 因此延迟到下面的 yield 分支再补 (每次元方法调用省 1 次 Rc inc/dec)。
     let caller_tbc_list = state.tbc_list;
     let caller_func = state.cur_func();
-    // perf: 元方法条目不再在调用前压入 —— 成功路径（绝大多数）根本没人看这条
-    // CallInfoEntry，压入它要给 FullCallInfo 分配一个 Box（每次元方法调用 1 次
-    // malloc/free）。改为只在真正需要时（错误 / yield）补压：
-    //  - 错误: 调用返回后把条目追加到 call_info 与 last_error_call_info 快照末尾
-    //    （语义位置就是最内层帧，与 C Lua 的 ci 链一致）；
-    //  - yield: resume 需要保留该帧。
-    // 非 Lua 闭包被调者走通用 pcall，它自己需要在调用前压条目（保持老行为）。
-    let is_lua = matches!(f, TValue::LClosure(_));
     // 元方法帧条目 (namewhat="metamethod") 必须在调用**前**压栈:
     // 元方法体内 `debug.getinfo(1).namewhat/name` 与 `error(msg, 2)` 的层级
     // 都依赖它 (tests_lua/db.lua 有断言)。
@@ -487,7 +485,7 @@ pub(crate) fn call_tm_res<'a>(
             saved_is_vararg: caller_is_vararg,
             saved_proto_flag: caller_proto_flag,
             saved_nextraargs: caller_nextraargs,
-            saved_closure: caller_closure.clone(),
+            saved_closure: None,
             saved_tbc_list: caller_tbc_list,
             func_idx: func_idx,
             logical_top: logical_top,
@@ -524,6 +522,12 @@ pub(crate) fn call_tm_res<'a>(
         if !protection.saved_filled {
             protection.saved_filled = true;
             protection.func_idx = func_idx;
+            // 延迟补 saved_closure (见上方说明): 调用者函数槽仍在栈上,
+            // 直接从栈上取 (不依赖 state.closure 此刻指向谁)。
+            protection.saved_closure = match state.stack.get(caller_func) {
+                Some(TValue::LClosure(c)) => Some(c.clone()),
+                _ => None,
+            };
             // saved_pc 已在 push 时设置为 caller_pc（被中断指令），不需 +1
         }
         let yield_values = state.pending_yield.take().unwrap_or_default();
@@ -534,8 +538,10 @@ pub(crate) fn call_tm_res<'a>(
     state.pcall_protection_stack.pop();
 
     // pcall 后: 栈截断到 func_idx，1 个结果(或错误消息)在 func_idx
+    // perf: 直接 move 出结果槽 (置 Nil), 不再 clone 一次 —— 元方法返回的
+    // 若是 Rc 持有值 (闭包/表/字符串) 每次省 1 次 Rc inc/dec。
     let result = if func_idx < state.top {
-        state.stack[func_idx].clone()
+        std::mem::replace(&mut state.stack[func_idx], TValue::Nil(NilKind::Empty))
     } else {
         TValue::Nil(NilKind::Strict)
     };
@@ -558,7 +564,7 @@ pub(crate) fn call_tm_res<'a>(
                     VmError::RuntimeError(msg)
                 }
             }
-            _ => VmError::RuntimeErrorValue(result.clone()),
+            _ => VmError::RuntimeErrorValue(result),
         });
     }
 
@@ -599,11 +605,12 @@ pub(crate) fn call_tm_res<'a>(
 /// 用于 `__newindex` 元方法 (table, key, value)。
 /// 支持 yield (使用 PcallProtection 机制)。
 pub(crate) fn call_tm<'a>(
+    // 同 call_tm_res: 按值接收, 调用方可直接 move (省一轮 Rc 引用计数)
     state: &mut LuaState<'a>,
-    f: &TValue<'a>,
-    p1: &TValue<'a>,
-    p2: &TValue<'a>,
-    p3: &TValue<'a>,
+    f: TValue<'a>,
+    p1: TValue<'a>,
+    p2: TValue<'a>,
+    p3: TValue<'a>,
     tm: TagMethod,
 ) -> Result<(), VmError<'a>> {
     // 同 call_tm_res: continuation 锚点是 C 的 `L->top` (= 压栈前的逻辑栈顶),
@@ -612,10 +619,12 @@ pub(crate) fn call_tm<'a>(
     // 压 scratch 前抬高 live top 到帧上界 (对应 C 的 `Protect(luaT_callTM)`)
     state.savestate();
     let func_idx = state.top;
-    state.push_value(f.clone());
-    state.push_value(p1.clone());
-    state.push_value(p2.clone());
-    state.push_value(p3.clone());
+    // 被调者是否为 Lua 闭包 —— 必须在 move 进栈槽之前判定
+    let is_lua = matches!(f, TValue::LClosure(_));
+    state.push_value(f);
+    state.push_value(p1);
+    state.push_value(p2);
+    state.push_value(p3);
 
     let caller_base = state.base;
     let caller_pc = state.pc;
@@ -623,17 +632,11 @@ pub(crate) fn call_tm<'a>(
     let caller_is_vararg = state.is_vararg;
     let caller_proto_flag = state.proto_flag;
     let caller_nextraargs = state.nextraargs;
-    let caller_closure = state.closure.clone();
+    // perf: 不再预先 clone 调用者闭包 —— 非 yield 路径由 pcall_impl 自行恢复,
+    // 本保护结构里的 saved_closure 只在 yield 穿出时才被 consumer 读取,
+    // 因此延迟到下面的 yield 分支再补 (每次元方法调用省 1 次 Rc inc/dec)。
     let caller_tbc_list = state.tbc_list;
     let caller_func = state.cur_func();
-    // perf: 元方法条目不再在调用前压入 —— 成功路径（绝大多数）根本没人看这条
-    // CallInfoEntry，压入它要给 FullCallInfo 分配一个 Box（每次元方法调用 1 次
-    // malloc/free）。改为只在真正需要时（错误 / yield）补压：
-    //  - 错误: 调用返回后把条目追加到 call_info 与 last_error_call_info 快照末尾
-    //    （语义位置就是最内层帧，与 C Lua 的 ci 链一致）；
-    //  - yield: resume 需要保留该帧。
-    // 非 Lua 闭包被调者走通用 pcall，它自己需要在调用前压条目（保持老行为）。
-    let is_lua = matches!(f, TValue::LClosure(_));
     // 元方法帧条目 (namewhat="metamethod") 必须在调用**前**压栈:
     // 元方法体内 `debug.getinfo(1).namewhat/name` 与 `error(msg, 2)` 的层级
     // 都依赖它 (tests_lua/db.lua 有断言)。
@@ -662,7 +665,7 @@ pub(crate) fn call_tm<'a>(
             saved_is_vararg: caller_is_vararg,
             saved_proto_flag: caller_proto_flag,
             saved_nextraargs: caller_nextraargs,
-            saved_closure: caller_closure.clone(),
+            saved_closure: None,
             saved_tbc_list: caller_tbc_list,
             func_idx: func_idx,
             logical_top: logical_top,
@@ -690,6 +693,11 @@ pub(crate) fn call_tm<'a>(
         if !protection.saved_filled {
             protection.saved_filled = true;
             protection.func_idx = func_idx;
+            // 延迟补 saved_closure (调用者函数槽仍在栈上)
+            protection.saved_closure = match state.stack.get(caller_func) {
+                Some(TValue::LClosure(c)) => Some(c.clone()),
+                _ => None,
+            };
         }
         let yield_values = state.pending_yield.take().unwrap_or_default();
         return Err(VmError::Yield(yield_values));
@@ -704,7 +712,7 @@ pub(crate) fn call_tm<'a>(
         // 元方法调用失败 — 保留 CallInfoEntry 供 traceback 使用
         // 上层 state.pcall 会保存 call_info 快照（包含此帧），然后截断到正确长度
         let result = if func_idx < state.top {
-            state.stack[func_idx].clone()
+            std::mem::replace(&mut state.stack[func_idx], TValue::Nil(NilKind::Empty))
         } else {
             TValue::Nil(NilKind::Strict)
         };
@@ -715,7 +723,7 @@ pub(crate) fn call_tm<'a>(
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                 VmError::RuntimeError(lua_string_as_str(s).to_string())
             }
-            _ => VmError::RuntimeErrorValue(result.clone()),
+            _ => VmError::RuntimeErrorValue(result),
         });
     }
     // 成功: pop CallInfoEntry, 截断栈
@@ -923,18 +931,21 @@ fn call_close_method_inner<'a>(
 /// ```
 ///
 /// 返回 true 表示找到并调用了元方法，false 表示未找到。
+/// 返回 `Ok((found, p1, p2))`：`found=true` 表示已调用元方法 (p1/p2 为占位 Nil)；
+/// `found=false` 表示未找到，**原样带回两个操作数**供调用方构造错误消息
+/// (按值传递让命中路径可以把操作数直接 move 进元方法栈槽，省两次 Rc 引用计数)。
 fn callbin_tm<'a>(
     state: &mut LuaState<'a>,
-    p1: &TValue<'a>,
-    p2: &TValue<'a>,
+    p1: TValue<'a>,
+    p2: TValue<'a>,
     res: usize,
     tm: TagMethod,
-) -> Result<bool, VmError<'a>> {
+) -> Result<(bool, TValue<'a>, TValue<'a>), VmError<'a>> {
     // 压 scratch / 走字符串算术快速路径前抬高 live top (对应 C 调用点的 `Protect(p1, p2)`)
     state.savestate();
     // 先从 p1 查找元方法，再从 p2 查找 — 对应 C 的 callbinTM
-    let tm_val = get_tm_by_obj(p1, tm, &state.dmt, &state.tmnames)
-        .or_else(|| get_tm_by_obj(p2, tm, &state.dmt, &state.tmnames));
+    let tm_val = get_tm_by_obj(&p1, tm, &state.dmt, &state.tmnames)
+        .or_else(|| get_tm_by_obj(&p2, tm, &state.dmt, &state.tmnames));
 
     match tm_val {
         Some(f) => {
@@ -942,32 +953,44 @@ fn callbin_tm<'a>(
             // 这些元方法会先将字符串操作数转换为数字，再执行算术运算
             if let TValue::Integer(0) = f {
                 // 先尝试字符串算术
-                if string_arith(state, p1, p2, res, tm)? {
-                    return Ok(true);
+                if string_arith(state, &p1, &p2, res, tm)? {
+                    return Ok((
+                        true,
+                        TValue::Nil(NilKind::Strict),
+                        TValue::Nil(NilKind::Strict),
+                    ));
                 }
                 // 字符串算术失败 — 对应 C 的 trymt: 查找 p2 的元方法
-                if let Some(f2) = get_tm_by_obj(p2, tm, &state.dmt, &state.tmnames) {
+                if let Some(f2) = get_tm_by_obj(&p2, tm, &state.dmt, &state.tmnames) {
                     if !matches!(f2, TValue::Integer(0)) {
                         // p2 有非字符串的元方法，调用它
-                        call_tm_res(state, &f2, p1, p2, res, tm)?;
-                        return Ok(true);
+                        call_tm_res(state, f2, p1, p2, res, tm)?;
+                        return Ok((
+                            true,
+                            TValue::Nil(NilKind::Strict),
+                            TValue::Nil(NilKind::Strict),
+                        ));
                     }
                     // p2 也是字符串，报错 (对应 trymt 中 p2 是 LUA_TSTRING)
                 }
                 // p2 没有元方法或也是字符串，报错
                 // 对应 C: luaL_error("attempt to %s a '%s' with a '%s'", ...)
                 let opname = tm.event_name();
-                let t1 = obj_type_name_(&state.string_table, p1);
-                let t2 = obj_type_name_(&state.string_table, p2);
+                let t1 = obj_type_name_(&state.string_table, &p1);
+                let t2 = obj_type_name_(&state.string_table, &p2);
                 return Err(VmError::RuntimeError(format!(
                     "attempt to {} a '{}' with a '{}'",
                     opname, t1, t2
                 )));
             }
-            call_tm_res(state, &f, p1, p2, res, tm)?;
-            Ok(true)
+            call_tm_res(state, f, p1, p2, res, tm)?;
+            Ok((
+                true,
+                TValue::Nil(NilKind::Strict),
+                TValue::Nil(NilKind::Strict),
+            ))
         }
-        None => Ok(false),
+        None => Ok((false, p1, p2)),
     }
 }
 
@@ -1093,7 +1116,10 @@ pub fn try_bin_tm<'a>(
     p1_reg: Option<usize>,
     p2_reg: Option<usize>,
 ) -> Result<(), VmError<'a>> {
-    if !callbin_tm(state, &p1, &p2, res, tm)? {
+    // perf: p1/p2 按值传入 callbin_tm —— 命中元方法时直接 move 进元方法栈槽,
+    // 未命中时原样带回用于报错 (省两次 Rc inc/dec)。
+    let (found, p1, p2) = callbin_tm(state, p1, p2, res, tm)?;
+    if !found {
         // 未找到元方法 — 根据事件类型报错。
         // perf: 变量名信息（varinfo）只在报错路径才需要，此前在 opcode 处理臂
         // 里无条件计算两次（每次 get_obj_name 都会扫局部变量表 + 反向扫字节码
@@ -1211,7 +1237,8 @@ pub fn try_concat_tm<'a>(
     p2: &TValue<'a>,
     res: usize,
 ) -> Result<(), VmError<'a>> {
-    if !callbin_tm(state, p1, p2, res, TagMethod::Concat)? {
+    let (found, _, _) = callbin_tm(state, p1.clone(), p2.clone(), res, TagMethod::Concat)?;
+    if !found {
         return Err(concaterror(state, p1, p2));
     }
     Ok(())
@@ -1242,10 +1269,10 @@ pub fn call_order_tm<'a>(
     let res = state.top;
     state.push_nil();
 
-    let found = callbin_tm(state, p1, p2, res, tm)?;
+    let (found, _, _) = callbin_tm(state, p1.clone(), p2.clone(), res, tm)?;
 
     if found {
-        let result = state.stack[res].clone();
+        let result = std::mem::replace(&mut state.stack[res], TValue::Nil(NilKind::Empty));
         state.truncate_live(res);
         state.pad_frame_scratch();
         Ok(!result.is_false())
@@ -1356,8 +1383,8 @@ pub fn equal_obj<'a>(
             state.savestate();
             let res = state.top;
             state.push_nil();
-            call_tm_res(state, &f, t1, t2, res, TagMethod::Eq)?;
-            let result = state.stack[res].clone();
+            call_tm_res(state, f, t1.clone(), t2.clone(), res, TagMethod::Eq)?;
+            let result = std::mem::replace(&mut state.stack[res], TValue::Nil(NilKind::Empty));
             state.truncate_live(res);
             state.pad_frame_scratch();
             Ok(!result.is_false())
@@ -1445,7 +1472,7 @@ pub fn obj_len<'a>(
     match tm {
         Some(f) => {
             // C: luaT_callTMres(L, tm, rb, rb, ra);
-            call_tm_res(state, &f, rb, rb, ra, TagMethod::Len)
+            call_tm_res(state, f, rb.clone(), rb.clone(), ra, TagMethod::Len)
         }
         None => Err(VmError::RuntimeError(format!(
             "attempt to get length of a {} value{}",

@@ -15,7 +15,7 @@
 use crate::alloc::MyRc;
 use crate::config::{LuaInteger, LuaNumber, LuaUnsigned, MAX_INTEGER, MIN_INTEGER};
 #[cfg(lua_use_longjmp)]
-use crate::helper::JmpBuf;
+use crate::helper::jmp_ptr;
 use crate::mem::SlotAlloc;
 use crate::objects::{
     CallFrame, Instruction, LClosure, LuaType, NilKind, Proto, TValue, UpVal, UpValVec, NO_UPVAL,
@@ -7486,11 +7486,11 @@ impl VmExecutor {
                 // lua_use_longjmp 模式: 用 setjmp/longjmp 替代 catch_unwind。
                 // 取 state 裸指针必须在最后一次 &mut state 访问**之后** —— 之后一律
                 // 经 ptr 访问, 否则裸指针会被 &mut 的重用作废 (Stacked/Tree Borrows)。
-                let mut jmp_buf = JmpBuf::default();
-                state.error_jmp_bufs.push(jmp_buf.as_mut_ptr());
+                let mut jmp_buf = crate::helper::JmpBuf::uninit();
+                state.error_jmp_bufs.push(jmp_ptr(&mut jmp_buf));
                 let ptr: *mut LuaState = state as *mut LuaState;
                 let result = unsafe {
-                    crate::state::lua_rs_pcall_c(Some(f), ptr as *mut c_void, jmp_buf.as_mut_ptr())
+                    crate::state::lua_rs_pcall_c(Some(f), ptr as *mut c_void, jmp_ptr(&mut jmp_buf))
                 };
                 state.error_jmp_bufs.pop();
                 if result == -1 {
@@ -9637,17 +9637,17 @@ impl VmExecutor {
         // res 设为帧上界之上 (call_tm_res 会 push func/p1/p2 在这之后)
         state.savestate();
         let res = state.top;
-        // 调用 call_tm_res (支持 yield)
+        // 调用 call_tm_res (支持 yield) — 三个操作数按值 move 进元方法栈槽
         crate::tm::call_tm_res(
             state,
-            &index_fn,
-            &table,
-            &key,
+            index_fn,
+            table,
+            key,
             res,
             crate::tm::TagMethod::Index,
         )?;
-        // 成功: 结果在 res 位置，栈长度为 res+1
-        let result = state.stack[res].clone();
+        // 成功: 结果在 res 位置 — 直接 move 出, 不再 clone 一次
+        let result = std::mem::replace(&mut state.stack[res], TValue::Nil(NilKind::Empty));
         // 截断栈，移除临时结果
         state.truncate_live(res);
         Ok(result)
@@ -9711,10 +9711,10 @@ impl VmExecutor {
                                 // __newindex 是函数: 调用 __newindex(table, key, val) (可能 yield)
                                 crate::tm::call_tm(
                                     state,
-                                    &newindex_val,
-                                    &current,
-                                    &key,
-                                    &val,
+                                    newindex_val.clone(),
+                                    current.clone(),
+                                    key.clone(),
+                                    val.clone(),
                                     crate::tm::TagMethod::NewIndex,
                                 )?;
                                 return Ok(());
@@ -9777,10 +9777,10 @@ impl VmExecutor {
                                     // __newindex 是函数: 调用 (可能 yield)
                                     crate::tm::call_tm(
                                         state,
-                                        &f,
-                                        &current,
-                                        &key,
-                                        &val,
+                                        f.clone(),
+                                        current.clone(),
+                                        key.clone(),
+                                        val.clone(),
                                         crate::tm::TagMethod::NewIndex,
                                     )?;
                                     return Ok(());

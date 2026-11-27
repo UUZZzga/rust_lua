@@ -9,6 +9,18 @@ impl JmpBuf {
     pub fn as_mut_ptr(&mut self) -> *mut core::ffi::c_void {
         self.data.as_mut_ptr() as *mut _
     }
+
+    /// 未初始化缓冲区 —— `setjmp` 会写入自己需要恢复的全部寄存器现场,
+    /// 之后 `longjmp` 只读回这些已写字段, 因此**无需**先把 256B 清零
+    /// (清零在元方法热路径上是每次 pcall 的固定开销)。
+    pub fn uninit() -> core::mem::MaybeUninit<Self> {
+        core::mem::MaybeUninit::uninit()
+    }
+}
+
+/// 取未初始化 `JmpBuf` 的裸指针 (供 `setjmp` / `longjmp` 使用)。
+pub fn jmp_ptr(buf: &mut core::mem::MaybeUninit<JmpBuf>) -> *mut core::ffi::c_void {
+    buf.as_mut_ptr().cast()
 }
 
 impl Default for JmpBuf {

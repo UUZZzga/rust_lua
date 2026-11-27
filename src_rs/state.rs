@@ -3,7 +3,7 @@ use crate::config::{LuaInteger, LuaNumber};
 use crate::execute::{VmError, VmExecutor, VmResult};
 use crate::gc::GCState;
 #[cfg(lua_use_longjmp)]
-use crate::helper::JmpBuf;
+use crate::helper::jmp_ptr;
 use crate::mem::SlotAlloc;
 use crate::mem::{AllocOwner, Allocator, DefaultAllocator, MemState};
 use crate::objects::{
@@ -1669,11 +1669,12 @@ impl<'a> LuaState<'a> {
                 let nargs_actual = self.top.saturating_sub(func_idx + 1);
                 let nfixparams = closure.proto.num_params as usize;
                 let proto_is_vararg = closure.proto.is_vararg();
+                let proto_flag = closure.proto.flag;
 
-                // 提前提取 proto 和闭包引用，使后续可以 move closure（而非 clone）
-                // perf: 消除 CallInfoEntry.closure 的 Box 堆分配
-                let proto = Rc::clone(&closure.proto);
-                let callee_closure = closure.clone();
+                // perf: 不再 Rc::clone(proto) —— 入口只需 num_params/is_vararg/flag
+                // 三个标量与一个裸指针比较; 元方法热路径上每次省 1 次 Rc inc/dec。
+                let proto_ptr = Rc::as_ptr(&closure.proto);
+                let callee_closure = closure;
 
                 let saved_base = self.base;
                 let saved_pc = self.pc;
@@ -1700,19 +1701,22 @@ impl<'a> LuaState<'a> {
                 // 的条目），或已推入 namewhat 非空的条目（如 call_tm_res 已推入
                 // namewhat="metamethod" 的条目），跳过以避免覆盖 namewhat。
                 let saved_call_info_len = self.call_info.len();
-                let caller_is_lua = self.base > 0
-                    && self.base <= self.top
-                    && matches!(&self.stack[self.cur_func()], TValue::LClosure(_));
+                // perf: caller_is_lua 只在需要压条目时用; 元方法热路径
+                // (meta_prepared=true ⇒ pushed_call_info=false) 完全跳过它
+                // (省一次 cur_func() 与 TValue 判别)。
                 let already_has_entry = meta_prepared
                     || self.call_info.last().map_or(false, |e| {
                         e.closure(&self.stack, &self.call_stack)
-                            .map_or(false, |c| Rc::ptr_eq(&c.proto, &proto))
+                            .map_or(false, |c| Rc::as_ptr(&c.proto) == proto_ptr)
                             || get_closure_from_stack(&self.stack, &self.call_stack, e)
-                                .map_or(false, |c| Rc::ptr_eq(&c.proto, &proto))
+                                .map_or(false, |c| Rc::as_ptr(&c.proto) == proto_ptr)
                             || (!e.namewhat().is_empty() && !e.is_c())
                     });
                 let pushed_call_info = !already_has_entry;
                 if pushed_call_info {
+                    let caller_is_lua = self.base > 0
+                        && self.base <= self.top
+                        && matches!(&self.stack[self.cur_func()], TValue::LClosure(_));
                     let (caller_base, caller_pc) = if caller_is_lua {
                         (self.base, self.pc)
                     } else {
@@ -1723,7 +1727,7 @@ impl<'a> LuaState<'a> {
                     // 且记录的是「调用者信息 + 被调闭包」的合成形态 —— 走 Full 自包含。
                     self.call_info.push(crate::state::CallInfoEntry::full(
                         !caller_is_lua,
-                        Some(closure),
+                        Some(callee_closure.clone()),
                         caller_base,
                         self.cur_func(),
                         caller_pc,
@@ -1732,17 +1736,14 @@ impl<'a> LuaState<'a> {
                         self.proto_flag,
                         self.nextraargs,
                     ));
-                } else {
-                    // 不需要 closure，drop 它
-                    drop(closure);
                 }
 
                 self.base = func_idx + 1;
                 self.pad_frame_scratch();
                 self.pc = 0;
-                self.num_params = proto.num_params;
-                self.is_vararg = proto.is_vararg();
-                self.proto_flag = proto.flag;
+                self.num_params = nfixparams as u8;
+                self.is_vararg = proto_is_vararg;
+                self.proto_flag = proto_flag;
                 self.nextraargs = 0;
                 // 关键: 将闭包转移到 state，供 GETUPVAL/SETUPVAL 使用
                 self.closure = Some(callee_closure);
@@ -1880,8 +1881,8 @@ impl<'a> LuaState<'a> {
                         //
                         // 顺序要求: jmp_buf 入栈必须在取 state 裸指针**之前**
                         // (裸指针派生出来之后不得再经 &mut self 访问 state)。
-                        let mut jmp_buf = JmpBuf::default();
-                        self.error_jmp_bufs.push(jmp_buf.as_mut_ptr());
+                        let mut jmp_buf = crate::helper::JmpBuf::uninit();
+                        self.error_jmp_bufs.push(jmp_ptr(&mut jmp_buf));
                         let mut outcome: Option<Result<VmResult<'a>, VmError<'a>>> = None;
                         let mut payload = ProtectedExec {
                             state: self as *mut LuaState<'a>,
@@ -1899,7 +1900,7 @@ impl<'a> LuaState<'a> {
                             lua_rs_pcall_c(
                                 Some(trampoline),
                                 &mut payload as *mut ProtectedExec<'a> as *mut std::ffi::c_void,
-                                jmp_buf.as_mut_ptr(),
+                                jmp_ptr(&mut jmp_buf),
                             )
                         };
                         self.error_jmp_bufs.pop();
@@ -2430,14 +2431,14 @@ impl<'a> LuaState<'a> {
                 // jmp_buf 分配在 Rust 栈上，指针压入 error_jmp_bufs 供 do_lua_error 取用。
                 // 取 state 裸指针必须在最后一次 &mut self 访问**之后** —— 之后一律经
                 // ptr 访问, 否则裸指针会被 &mut 的重用作废 (Stacked/Tree Borrows)。
-                let mut jmp_buf = JmpBuf::default();
-                self.error_jmp_bufs.push(jmp_buf.as_mut_ptr());
+                let mut jmp_buf = crate::helper::JmpBuf::uninit();
+                self.error_jmp_bufs.push(jmp_ptr(&mut jmp_buf));
                 let ptr: *mut LuaState = self as *mut LuaState;
                 let result = unsafe {
                     lua_rs_pcall_c(
                         Some(f),
                         ptr as *mut c_void,
-                        jmp_buf.as_mut_ptr() as *mut c_void,
+                        crate::helper::jmp_ptr(&mut jmp_buf),
                     )
                 };
                 self.error_jmp_bufs.pop();
