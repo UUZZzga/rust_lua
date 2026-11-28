@@ -7088,9 +7088,11 @@ impl VmExecutor {
 
         // CallInfo Meta 条目必须在调用**前**压栈 (元方法体内 debug.getinfo(1)
         // .namewhat/name 与 error(msg, 2) 层级依赖它; 与旧 call_tm_res 一致)
+        // perf: 调用者 func 槽恒为 `base - 1` (见 `LuaState::frame_top` 说明),
+        // 直接算而不用 `cur_func()` (后者还要读保护栈判 barrier, 每次 ~14 条指令)。
         state.call_info.push(crate::state::CallInfoEntry::meta(
             state.base,
-            state.cur_func(),
+            state.base.saturating_sub(1),
             state.pc, // 调用方已同步为被中断指令
             tm.event_name(),
             state.proto_flag,
@@ -9803,12 +9805,9 @@ impl VmExecutor {
                         // perf: 直接用「按对象查元方法」的零临时 clone 路径
                         // (借元表槽 + 元方法名直查), 免去元表 Rc clone 与
                         // make_tm_tvalue 构造 TValue 键。
-                        let index_val = crate::tm::get_tm_by_obj(
-                            curr,
-                            crate::tm::TagMethod::Index,
-                            &state.dmt,
-                            &state.tmnames,
-                        );
+                        // 进一步: 表格走专用的单次借用直取 (免外层分派 +
+                        // 元表 RefCell 借用标志写入)。
+                        let index_val = t.get_tm_lookup(&state.tmnames[TagMethod::Index as usize]);
                         if let Some(index_val) = index_val {
                             match &index_val {
                                 TValue::Table(_) => {

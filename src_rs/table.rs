@@ -220,8 +220,37 @@ impl<'a> Table<'a> {
     /// VM 单线程、查找期间无重入点）。
     pub fn get_tm_owned(&self, key: &TValue<'a>) -> Option<TValue<'a>> {
         let guard = self.data.borrow();
-        if guard.hash_buckets.len() <= 8 {
-            for (k, v) in guard.hash_buckets.iter() {
+        Self::scan_tm(&guard, key)
+    }
+
+    /// 元表 TM 直取 (与 `get_tm_by_obj` 的 Table 分支等价) ——
+    /// 一次借用内完成「取元表 + 元表扫描」。
+    ///
+    /// perf(元方法热路径: `__index` / 算术 / 比较 / 拼接):
+    /// - 省去外层分派与二次函数调用;
+    /// - fast_unsafe 下用 `data_ro()` 取代 `borrow()`: 不写 RefCell 借用标志 ——
+    ///   元表的借用标志与数据同处一条缓存线, 每次查找都脏化它
+    ///   (profile: `get_tm_owned` CPI 0.73, 停顿主导)。
+    #[cfg_attr(not(size_optimized), inline(always))]
+    pub fn get_tm_lookup(&self, key: &TValue<'a>) -> Option<TValue<'a>> {
+        #[cfg(feature = "fast_unsafe")]
+        {
+            let mt = self.data_ro().metatable.as_ref()?;
+            Self::scan_tm(mt.data_ro(), key)
+        }
+        #[cfg(not(feature = "fast_unsafe"))]
+        {
+            let guard = self.data.borrow();
+            let mt = guard.metatable.as_ref().map(|b| &**b)?;
+            Self::scan_tm(mt, key)
+        }
+    }
+
+    /// 元表内 TM 扫描本体 — 供 `get_tm_owned` / `get_tm_index_owned` 共用。
+    #[inline]
+    fn scan_tm(data: &TableData<'a>, key: &TValue<'a>) -> Option<TValue<'a>> {
+        if data.hash_buckets.len() <= 8 {
+            for (k, v) in data.hash_buckets.iter() {
                 if matches!(k, ks @ (TValue::LongStr(_) | TValue::ShortStr(_)) if ks == key)
                     && !v.is_nil()
                 {
@@ -232,14 +261,13 @@ impl<'a> Table<'a> {
         }
         use crate::objects::tvalue_fx_hash;
 
-        let d: &TableData<'a> = &guard;
-        let ktb = d.key_to_bucket.as_ref()?;
+        let ktb = data.key_to_bucket.as_ref()?;
         let hash = tvalue_fx_hash(key);
         let (_, idx) = ktb.find(
             hash,
             |(k, _)| matches!(k, ks@(TValue::LongStr(_)|TValue::ShortStr(_)) if ks == key),
         )?;
-        let v = &d.hash_buckets[*idx].1;
+        let v = &data.hash_buckets[*idx].1;
         // C: notm — nil (含 Empty tombstone) 视为无元方法
         if v.is_nil() {
             None

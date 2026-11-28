@@ -331,20 +331,15 @@ pub fn get_tm_by_obj<'a>(
     // Ref::filter_map 安全新式借用 (无 unsafe), 命中后仅 clone 一次值。
     let key = &tmnames[tm as usize];
     match obj {
-        TValue::Table(t) => {
-            // perf: 普通 borrow 直查元表槽 + owned 结果 —— 消除 Ref::filter_map
-            // 借用旗标与闭包间接开销（命中后本来就要 clone, Ref 无意义）。
-            // 嵌套借用的是不同 RefCell（或同 RefCell 的多重共享借用），安全。
-            let guard = t.data.borrow();
-            let mt = guard.metatable.as_ref().map(|b| &**b)?;
-            mt.get_tm_owned(key)
-        }
+        TValue::Table(t) => t.get_tm_lookup(key),
         TValue::UserData(u) => {
             let guard = u.metatable.borrow();
             let mt: &Table = guard.as_ref()?;
             mt.get_tm_owned(key)
         }
         other => {
+            // 注意: `mt` 本身就是元表, 要扫描它自身 (get_tm_owned),
+            // 不能用 get_tm_lookup (那会去找 mt 的元表)。
             let mt: &Table = default_mts.get(other.ty())?;
             mt.get_tm_owned(key)
         }
