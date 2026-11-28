@@ -3552,6 +3552,25 @@ impl VmExecutor {
     /// 返回 true 时调用者应调用 `finish_metamethod` 完成 continuation。
     /// 拆分两步避免借用冲突: 检查只读 state, 处理需要 &mut state + result 引用。
     /// (perf: 主路径 is_mm=false, 完全避免 clone TValue)
+    /// perf: 保护栈顶是否**可能**对本帧返回生效 —— 三种 continuation
+    /// (metamethod / close / pcall) 都要求被保护函数的帧正是当前返回帧
+    /// (`t.func_idx + 1 == state.base`); C 函数 `__close` 的 resume 形态要求
+    /// `t.saved_base == state.base`。二者都不满足时可安全走返回快路径
+    /// (对应 C 只在被保护 ci 上置 `CIST_YPCALL` 的判定)。
+    ///
+    /// 典型收益: 整段 bench 被外层 `pcall` 包住时, 栈非空但被保护帧在更外层,
+    /// 每次返回都能省掉 3 次 continuation 检查 (~55 条指令)。
+    #[inline(always)]
+    fn protection_adjacent(state: &LuaState) -> bool {
+        match state.pcall_protection_stack.last() {
+            Some(t) => {
+                t.func_idx + 1 == state.base
+                    || (t.is_close_continuation && t.saved_base == state.base)
+            }
+            None => false,
+        }
+    }
+
     fn is_metamethod_return<'a>(state: &LuaState) -> bool {
         state.pcall_protection_stack.last().map_or(false, |t| {
             t.is_metamethod && t.saved_filled && t.func_idx + 1 == state.base
@@ -8231,11 +8250,13 @@ impl VmExecutor {
         // `table.pack(co())` 在 close-yield 后返回 0 个值 —— 捕获到的是别的指令残留值)。
         state.set_mret_end(a + nresults);
 
-        // perf: 快速路径 — 无 pcall 保护且无 open upvalue 时跳过 3 个 continuation 检查
-        // (is_metamethod_return / finish_close_continuation / try_finish_pcall_return 各做
-        // 一次 pcall_protection_stack.last() Vec 访问, 普通函数调用全为空, 占 ~69% 热点)
-        // 此分支命中时直接走 call_stack.pop() 主路径
-        if state.pcall_protection_stack.is_empty() && !Self::need_close_upvals(state, state.base) {
+        // perf: 快速路径 — 保护栈顶对本帧返回不可能生效且无 open upvalue 时,
+        // 跳过 3 个 continuation 检查 (is_metamethod_return / finish_close_continuation /
+        // try_finish_pcall_return 各做一次 pcall_protection_stack.last() Vec 访问)。
+        // 注意: 保护栈非空 ≠ 需要检查 —— bench 常被外层 pcall 包住, 此时栈非空但
+        // 被保护帧在更外层; 三者都要求 `func_idx + 1 == base`, 故用
+        // [`Self::protection_adjacent`] 一次判定。
+        if !Self::protection_adjacent(state) && !Self::need_close_upvals(state, state.base) {
             state.g_mut().twups_linked = false;
             // 直接走 call_stack.pop() 主路径 (下方代码)
             return Self::op_return_finish(state, a, nresults);
@@ -8413,8 +8434,9 @@ impl VmExecutor {
         pc: usize,
     ) -> Result<Option<VmResult<'a>>, VmError<'a>> {
         state.pc = pc - 1;
-        // perf: 快速路径 — 无 pcall 保护且无 open upvalue 时跳过 continuation 检查
-        if state.pcall_protection_stack.is_empty() && !Self::need_close_upvals(state, state.base) {
+        // perf: 快速路径 — 保护栈顶对本帧返回不可用生效且无 open upvalue 时
+        // 跳过 continuation 检查 (见 op_return 注释 / [`Self::protection_adjacent`])
+        if !Self::protection_adjacent(state) && !Self::need_close_upvals(state, state.base) {
             state.g_mut().twups_linked = false;
             return Self::op_return0_finish(state);
         }
@@ -8546,8 +8568,9 @@ impl VmExecutor {
         // 对应 C 的 OP_RETURN1: L->top = ra + 1 (寄存器槽位恒已初始化)
         state.top = a + 1;
         state.pc = pc - 1;
-        // perf: 快速路径 — 无 pcall 保护且无 open upvalue 时跳过 continuation 检查
-        if state.pcall_protection_stack.is_empty() && !Self::need_close_upvals(state, state.base) {
+        // perf: 快速路径 — 保护栈顶对本帧返回不可用生效且无 open upvalue 时
+        // 跳过 continuation 检查 (见 op_return 注释 / [`Self::protection_adjacent`])
+        if !Self::protection_adjacent(state) && !Self::need_close_upvals(state, state.base) {
             state.g_mut().twups_linked = false;
             let val = std::mem::take(&mut state.stack[a]);
             return Self::op_return1_finish(state, a, val);
